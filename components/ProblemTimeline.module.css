@@ -1,0 +1,108 @@
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--s-6);
+  margin-top: var(--s-12);
+}
+
+.track {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--s-6);
+  background: var(--surface);
+}
+.track.good {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  background: color-mix(in srgb, var(--accent-weak) 45%, var(--surface));
+}
+
+.trackHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding-bottom: var(--s-4);
+  margin-bottom: var(--s-2);
+  border-bottom: 1px solid var(--border);
+}
+.trackLabel {
+  font-family: var(--font-mono);
+  font-size: var(--step--1);
+  color: var(--ink);
+  word-break: break-word;
+}
+.good .trackLabel {
+  color: var(--accent);
+}
+.trackSub {
+  flex: none;
+  font-size: var(--step--1);
+  color: var(--muted);
+}
+
+.steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.step {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+  padding: var(--s-3) 0;
+  padding-left: var(--s-2);
+  color: var(--ink-2);
+  font-size: var(--step-0);
+}
+/* connector line between nodes */
+.step:not(:last-child)::before {
+  content: "";
+  position: absolute;
+  left: calc(var(--s-2) + 5px);
+  top: 50%;
+  bottom: -50%;
+  width: 1.5px;
+  background: var(--border-strong);
+}
+
+.node {
+  position: relative;
+  z-index: 1;
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 1.5px solid var(--border-strong);
+}
+.stepText {
+  line-height: 1.35;
+}
+
+.is-bad .node {
+  border-color: var(--danger);
+  background: var(--danger);
+}
+.is-bad .stepText {
+  color: var(--ink);
+  font-weight: 550;
+}
+.is-good .node {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+.is-good .stepText {
+  color: var(--ink);
+  font-weight: 550;
+}
+.good .step:not(:last-child)::before {
+  background: color-mix(in srgb, var(--accent) 35%, var(--border-strong));
+}
+
+@media (max-width: 720px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}

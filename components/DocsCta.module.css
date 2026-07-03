@@ -1,0 +1,35 @@
+.card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  padding: var(--s-16) var(--s-8);
+  text-align: center;
+}
+
+.title {
+  font-size: var(--step-4);
+  max-width: 18ch;
+  margin-inline: auto;
+}
+.lead {
+  margin: var(--s-4) auto 0;
+  max-width: 52ch;
+  font-size: var(--step-1);
+  color: var(--ink-2);
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--s-3);
+  margin-top: var(--s-8);
+}
+
+@media (max-width: 640px) {
+  .card {
+    padding: var(--s-12) var(--s-5);
+  }
+  .title {
+    font-size: var(--step-3);
+  }
+}

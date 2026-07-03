@@ -1,7 +1,0 @@
-✓ PASS  Docker Engine reachable    Docker daemon responded to ping
-⚠ WARN  Proxy reachable            no response from http://localhost:9900: connection refused
-                                     → If you expect a proxy to be running: docker ps --filter name=docker-rollout-proxy
-✗ FAIL  Recovery state consistent  proxy reports degraded recovery state
-                                     → Run 'docker orbit status' for detail
-
-1 passed, 1 warning, 1 error
