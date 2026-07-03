@@ -1,0 +1,103 @@
+version: "3.9"
+
+# This is the output of: docker-rollout generate --file examples/basic/docker-compose.yml
+# It shows exactly what Docker Rollout adds to a simple two-service stack.
+#
+# Key changes from the input:
+#
+#   api:
+#     - ports removed (moved to docker-rollout-proxy-api)
+#     - expose: ["3000"] added
+#     - docker_rollout_mesh network added
+#     - DOCKER_ROLLOUT_BACKEND env var added
+#     - docker-rollout labels added
+#
+#   db: unchanged (postgres is in the auto-excluded database list)
+#
+#   docker-rollout-proxy-api: NEW service
+#     - owns the host port :3000
+#     - image: docker-rollout/proxy:latest
+#     - configured entirely via env vars
+#     - always restarts unless explicitly stopped
+
+networks:
+  docker_rollout_mesh:
+    driver: bridge
+
+volumes:
+  db_data:
+
+services:
+
+  # ── Backing service (was: api) ────────────────────────────────────────────
+  api:
+    image: myapp:1.0
+    # ports removed from here — they now belong to docker-rollout-proxy-api
+    expose:
+      - "3000"
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://app:secret@db:5432/appdb
+      # Injected by Docker Rollout — informational, points to this service's own address
+      DOCKER_ROLLOUT_BACKEND: "api:3000"
+    networks:
+      # docker_rollout_mesh added — required for proxy ↔ backing service communication
+      - docker_rollout_mesh
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    labels:
+      docker-rollout.managed: "true"
+      docker-rollout.service: "api"
+
+  # ── Proxy service (injected by Docker Rollout) ───────────────────────────────────
+  docker-rollout-proxy-api:
+    image: docker-rollout/proxy:latest
+    # This service owns the original :3000 → :3000 binding.
+    # It never restarts during a rollout — the host port stays open permanently.
+    ports:
+      - "3000:3000"
+    expose:
+      - "9900"    # control API — internal only
+    networks:
+      - docker_rollout_mesh
+    depends_on:
+      - api
+    environment:
+      # listenPort:targetPort pairs, comma-separated
+      DOCKER_ROLLOUT_BINDS: "3000:3000"
+      # Initial backend: id:host:port (host is the service DNS name on docker_rollout_mesh)
+      DOCKER_ROLLOUT_TARGETS: "api-default:api:3000"
+      # Control API port (POST /backends, DELETE /backends/{id}, etc.)
+      DOCKER_ROLLOUT_CONTROL_PORT: "9900"
+      # DOCKER_ROLLOUT_API_TOKEN: ""    uncomment and set to enable bearer auth
+    restart: unless-stopped
+    labels:
+      docker-rollout.proxy: "true"
+      docker-rollout.service: "api"
+      docker-rollout.managed: "true"
+
+  # ── Database (unchanged) ─────────────────────────────────────────────────
+  # postgres is in the auto-excluded list — Docker Rollout does not inject a proxy.
+  # The service is copied verbatim from the input.
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: appdb
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped

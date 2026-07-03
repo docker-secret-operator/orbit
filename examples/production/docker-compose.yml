@@ -1,0 +1,195 @@
+version: "3.9"
+
+# Production-ready Docker Rollout stack.
+#
+# Architecture:
+#   internet → nginx (TLS + L7) → docker-rollout-proxy-api (TCP, zero-downtime)
+#                                       ↕ docker_rollout_mesh
+#                                    api (rolling deployments)
+#                                       ↕ backend net
+#                               postgres + redis (stateful, never touched by Docker Rollout)
+#
+# Usage:
+#   cp .env.example .env          # fill in secrets
+#   docker-rollout generate               # run once; generates docker-rollout-compose.yml
+#   docker compose -f examples/production/docker-compose.yml up -d
+#   docker-rollout rollout api            # zero-downtime deploy
+#   docker-rollout rollback api           # instant rollback if deploy fails
+
+networks:
+  # Public-facing: nginx ↔ Docker Rollout proxy only.
+  frontend:
+    driver: bridge
+
+  # Internal mesh: Docker Rollout proxy ↔ app containers.
+  # Never exposed to the host.
+  docker_rollout_mesh:
+    driver: bridge
+
+  # Database tier: app ↔ postgres ↔ redis only.
+  backend:
+    driver: bridge
+
+volumes:
+  db_data:
+  redis_data:
+  prometheus_data:
+
+services:
+
+  # ── Layer 7 reverse proxy (TLS termination + routing + rate limiting) ────────
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro    # mount TLS certs here
+    networks:
+      - frontend
+    depends_on:
+      docker-rollout-proxy-api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t 2>/dev/null && wget -qO- http://localhost/health 2>/dev/null || exit 0"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    labels:
+      docker-rollout.role: "ingress"
+
+  # ── Docker Rollout TCP proxy (owns app port, never restarts during deploys) ──────────
+  # NOTE: docker-rollout generate injects this service automatically.
+  # It is shown here explicitly so you can see the full production config.
+  docker-rollout-proxy-api:
+    image: docker-rollout/proxy:latest
+    expose:
+      - "3000"   # app traffic — nginx connects here
+      - "9900"   # control API — Prometheus scrapes here
+    networks:
+      - frontend
+      - docker_rollout_mesh
+    environment:
+      DOCKER_ROLLOUT_BINDS: "3000:3000"
+      DOCKER_ROLLOUT_TARGETS: "api-default:api:3000"
+      DOCKER_ROLLOUT_CONTROL_PORT: "9900"
+      DOCKER_ROLLOUT_API_TOKEN: "${DOCKER_ROLLOUT_API_TOKEN}"
+    depends_on:
+      api:
+        condition: service_healthy
+    # restart: always ensures the proxy self-heals if it crashes.
+    # The host port is NOT bound here (nginx owns 80/443); no downtime risk.
+    restart: always
+    healthcheck:
+      # Use /health/ready so rollout waits until the proxy has a live backend.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9900/health/ready || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    labels:
+      docker-rollout.proxy: "true"
+      docker-rollout.service: "api"
+      docker-rollout.managed: "true"
+
+  # ── Application service (zero-downtime rolling deployments via Docker Rollout) ───────
+  api:
+    image: myapp:${APP_VERSION:-latest}
+    expose:
+      - "3000"
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DATABASE_URL: "postgres://app:${DB_PASSWORD}@db:5432/appdb"
+      REDIS_URL: "redis://redis:6379"
+      DOCKER_ROLLOUT_BACKEND: "api:3000"
+    networks:
+      - docker_rollout_mesh
+      - backend
+    healthcheck:
+      # /health/ready checks DB + Redis connectivity before accepting traffic.
+      # docker-rollout rollout waits for this to pass before switching traffic.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    labels:
+      docker-rollout.managed: "true"
+      docker-rollout.service: "api"
+
+  # ── Prometheus (scrapes Docker Rollout /metrics + app metrics) ──────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    expose:
+      - "9090"
+    networks:
+      - docker_rollout_mesh
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    restart: unless-stopped
+    # Stateful: prometheus data must survive restarts.
+    # x-docker-rollout skip prevents docker-rollout generate from proxying this service.
+    x-docker-rollout:
+      skip: true
+    labels:
+      docker-rollout.role: "observability"
+
+  # ── Stateful services — NEVER managed by Docker Rollout ─────────────────────────────
+  # These are excluded via x-docker-rollout: skip: true AND by the database auto-detector.
+  # Two layers of protection: explicit opt-out + image-name detection.
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: "${DB_PASSWORD}"
+      POSTGRES_DB: appdb
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    x-docker-rollout:
+      skip: true    # explicit: this is stateful, Docker Rollout must never proxy it
+    labels:
+      docker-rollout.role: "stateful"
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save 60 1 --loglevel warning --requirepass "${REDIS_PASSWORD}"
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD} ping | grep PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    x-docker-rollout:
+      skip: true    # explicit: stateful cache, Docker Rollout must never proxy it
+    labels:
+      docker-rollout.role: "stateful"

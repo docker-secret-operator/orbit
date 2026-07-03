@@ -1,0 +1,99 @@
+# GoReleaser configuration for Orbit — native Docker CLI plugin distribution.
+# Validate locally without publishing:  goreleaser release --snapshot --clean
+# Docs: https://goreleaser.com
+version: 2
+
+project_name: docker-orbit
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: docker-orbit
+    main: ./cmd/docker-orbit
+    binary: docker-orbit
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    # Version is injected into the existing main.version variable
+    # (cmd/docker-orbit/main.go). -s -w strip debug info for smaller binaries.
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    # Reproducible builds: pin the binary's internal timestamp to the commit,
+    # so the same source + tag always produces byte-identical output.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: docker-orbit
+    ids:
+      - docker-orbit
+    # e.g. docker-orbit_v1.2.3_linux_amd64.tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+# Native Linux packages. The binary is installed to /usr/bin (on PATH, so the
+# standalone `docker-orbit` works) and symlinked into the system Docker CLI
+# plugins directory (so `docker orbit ...` works). Orbit has no package-owned
+# config files — configuration is environment-variable driven and runtime state
+# lives outside the package (see docs/installation.md) — so uninstall is
+# inherently non-destructive: it removes only the binary and symlink.
+nfpms:
+  - id: docker-orbit
+    package_name: docker-orbit
+    ids:
+      - docker-orbit
+    vendor: Orbit
+    homepage: https://github.com/docker-secret-operator/orbit
+    maintainer: umairmd385 <umairmd385@gmail.com>
+    description: Zero-downtime deployments for Docker Compose (native Docker CLI plugin).
+    license: MIT
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    contents:
+      - src: /usr/bin/docker-orbit
+        dst: /usr/local/lib/docker/cli-plugins/docker-orbit
+        type: symlink
+
+release:
+  github:
+    owner: docker-secret-operator
+    name: orbit
+  # Never auto-publish from a snapshot/local run.
+  prerelease: auto
+  draft: false
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+# ── Future code signing (extension point — enable without restructuring) ──────
+# Distribution is designed to support signing later with no redesign:
+#   signs:
+#     - cmd: cosign
+#       args: ["sign-blob", "--yes", "--output-signature=${signature}", "${artifact}"]
+#       artifacts: checksum
+# and/or GPG-signed checksums. Left disabled until signing keys/policy exist.

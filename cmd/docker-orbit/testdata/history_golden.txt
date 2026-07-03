@@ -1,0 +1,5 @@
+History for "myapp"
+
+TIME                 TYPE               RESULT   DURATION  TRIGGER  DETAIL
+2026-07-02 10:00:00  rollout_completed  success  1500ms    cli      gen-1 → gen-2
+2026-07-02 09:00:00  rollout_failed     failure  -         cli      healthcheck timeout
