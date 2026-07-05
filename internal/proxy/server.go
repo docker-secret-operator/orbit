@@ -48,6 +48,8 @@ type Server struct {
 	mu          sync.RWMutex
 	listeners   map[int]*portListener // real listen port → listener
 	activeConns sync.WaitGroup        // tracks in-flight connections for graceful drain
+
+	retry RetryPolicy // passive-failover retry policy (WP-B2)
 }
 
 // NewServer creates a proxy server backed by the given router and metrics.
@@ -57,8 +59,12 @@ func NewServer(router *Router, log *zap.Logger, m *metrics.Proxy) *Server {
 		log:       log,
 		metrics:   m,
 		listeners: make(map[int]*portListener),
+		retry:     DefaultRetryPolicy(),
 	}
 }
+
+// SetRetryPolicy overrides the passive-failover retry policy. Startup-only.
+func (s *Server) SetRetryPolicy(p RetryPolicy) { s.retry = p }
 
 // Bind opens a TCP listener for the given PortBinding. Accepts connections
 // asynchronously; returns once the listener is open.
@@ -211,20 +217,11 @@ func (s *Server) handleConn(client net.Conn) {
 		client.Close()
 	}()
 
-	backend, err := s.router.Next()
+	upstream, backend, err := s.dialWithFailover()
 	if err != nil {
 		s.metrics.ConnFailed()
-		s.log.Warn("proxy: no backend — dropping connection",
+		s.log.Warn("proxy: no reachable backend — dropping connection",
 			zap.String("client", client.RemoteAddr().String()),
-			zap.Error(err))
-		return
-	}
-
-	upstream, err := dialer.Dial("tcp", backend.Addr)
-	if err != nil {
-		s.metrics.ConnFailed()
-		s.log.Warn("proxy: dial backend failed",
-			zap.String("addr", backend.Addr),
 			zap.Error(err))
 		return
 	}
@@ -236,6 +233,66 @@ func (s *Server) handleConn(client net.Conn) {
 		zap.String("backend_id", backend.ID))
 
 	pipe(client, upstream)
+}
+
+// dialWithFailover selects up to RetryPolicy.Candidates() backends and dials
+// them in deterministic order, retrying transport (connect-time) failures
+// against the next healthy candidate. It returns the first established upstream,
+// or an error if every candidate is unreachable.
+//
+// This is L4 passive failover: the retry happens BEFORE any client bytes are
+// forwarded, so no request data is ever replayed. Because the proxy operates at
+// L4 it never observes HTTP status — application responses (404/500) can never
+// reach this path and thus never trigger failover (WP-B2 §B2.5). Each failed
+// attempt is reported to the Runtime Registry; the Health Controller (not the
+// Traffic Engine) owns any resulting state transition.
+func (s *Server) dialWithFailover() (net.Conn, *Backend, error) {
+	candidates, err := s.router.NextCandidates(s.retry.Candidates())
+	if err != nil {
+		return nil, nil, err // candidate-exhaustion metric emitted by the router
+	}
+
+	start := time.Now()
+	var lastErr error
+	for i, b := range candidates {
+		if i > 0 {
+			s.metrics.IncFailoverAttempts()
+		}
+		upstream, derr := dialer.Dial("tcp", b.Addr)
+		if derr == nil {
+			if i > 0 {
+				s.metrics.IncFailoverSuccess()
+				s.metrics.AddRetryLatency(time.Since(start))
+				s.log.Warn("proxy: passive failover succeeded",
+					zap.String("failed_backend", candidates[i-1].ID),
+					zap.String("replacement_backend", b.ID),
+					zap.Int("retry_count", i),
+					zap.String("failure_reason", errString(lastErr)),
+					zap.Duration("elapsed", time.Since(start)))
+			}
+			return upstream, b, nil
+		}
+		lastErr = derr
+		s.router.ReportDialFailure(b.ID)
+		if !isRetryableDialError(derr) {
+			break
+		}
+	}
+	s.metrics.IncFailoverExhausted()
+	return nil, nil, fmt.Errorf("all %d candidate backend(s) unreachable: %w", len(candidates), lastErr)
+}
+
+// isRetryableDialError reports whether a dial error is a transport failure that
+// may be retried against another backend. At L4 every dial failure (connection
+// refused, timeout, reset, host/network unreachable) is a transport failure, so
+// any non-nil dial error is retryable. Application/HTTP errors never appear here.
+func isRetryableDialError(err error) bool { return err != nil }
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // ── Bidirectional pipe ────────────────────────────────────────────────────────

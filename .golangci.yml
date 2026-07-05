@@ -1,0 +1,49 @@
+# golangci-lint configuration (schema v2).
+#
+# Baseline established during the Pre-WP-B2 Stabilization pass. Every exclusion
+# is intentional and documented below. Production hot-path code is NOT blanket-
+# excluded: genuine cleanup calls carry per-site //nolint:errcheck justifications;
+# only conventional, known-safe patterns are handled here.
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      # Errors from these calls are intentionally not checked project-wide: they
+      # are best-effort resource cleanup / teardown, or a Prometheus text dump,
+      # where the returned error is neither actionable nor recoverable.
+      exclude-functions:
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - (io.Closer).Close
+        - (*os.File).Close
+        - os.Remove
+        - fmt.Fprintf
+        - fmt.Fprint
+        - fmt.Fprintln
+  exclusions:
+    rules:
+      # Test files: ignoring cleanup errors (Sync/Setenv/Unsetenv/Release/Close/
+      # Chmod) is a conventional, accepted testing pattern.
+      - path: _test\.go
+        linters: [errcheck]
+      # internal/stack is a FROZEN experimental package (see internal/stack/README.md
+      # and ADR-0005): imported by zero commands, slated for Orbit v2. It is
+      # intentionally excluded from lint until activation; no production code
+      # depends on it, and it must not be edited during v1 work.
+      - path: internal/stack/
+        linters: [errcheck, unused, staticcheck, ineffassign]
+      # internal/testing is the soak / benchmark / chaos harness (not shipped).
+      # Its scaffolding fields and cleanup calls are intentional.
+      - path: internal/testing/
+        linters: [errcheck, unused, staticcheck]
+      # Stylistic staticcheck opinions that are not defects for this codebase:
+      #   QF100x — tagged-switch / De Morgan / lift-condition "quickfix" nudges
+      #   S1038  — t.Log(fmt.Sprintf(...)) preference
+      #   ST1005 — Orbit intentionally uses multi-line, punctuated CLI error text
+      - text: "QF100"
+        linters: [staticcheck]
+      - text: "S1038"
+        linters: [staticcheck]
+      - text: "ST1005"
+        linters: [staticcheck]

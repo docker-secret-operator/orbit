@@ -59,7 +59,7 @@ func AcquireLock(service string) (*FileLock, error) {
 	if err == nil {
 		// Lock acquired successfully.
 		data, _ := json.MarshalIndent(meta, "", "  ")
-		f.Write(data)
+		f.Write(data) //nolint:errcheck // lock file already created via O_EXCL; metadata write is advisory
 		f.Close()
 		return &FileLock{path: lockPath, meta: meta}, nil
 	}

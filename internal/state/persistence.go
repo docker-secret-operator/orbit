@@ -293,7 +293,7 @@ func (sm *StateManager) LoadActiveGenerationState(service string) (*ActiveGenera
 	if err != nil {
 		return nil, fmt.Errorf("cannot acquire read lock: %w", err)
 	}
-	defer lock.Release()
+	defer lock.Release() //nolint:errcheck // advisory lock release on cleanup; error not actionable
 
 	// Also use in-process RWMutex for same-process safety
 	inProcessLock := sm.getInProcessLock(service)
@@ -343,7 +343,7 @@ func (sm *StateManager) WriteActiveGenerationState(state *ActiveGenerationState,
 	if err != nil {
 		return fmt.Errorf("cannot acquire write lock: %w", err)
 	}
-	defer lock.Release()
+	defer lock.Release() //nolint:errcheck // advisory lock release on cleanup; error not actionable
 
 	// Also use in-process RWMutex
 	inProcessLock := sm.getInProcessLock(state.Service)
@@ -380,7 +380,7 @@ func (sm *StateManager) LoadRolloutState(service string) (*RolloutState, error) 
 	if err != nil {
 		return nil, fmt.Errorf("cannot acquire read lock: %w", err)
 	}
-	defer lock.Release()
+	defer lock.Release() //nolint:errcheck // advisory lock release on cleanup; error not actionable
 
 	inProcessLock := sm.getInProcessLock(service)
 	inProcessLock.RLock()
@@ -424,7 +424,7 @@ func (sm *StateManager) WriteRolloutState(state *RolloutState, log interface{}) 
 	if err != nil {
 		return fmt.Errorf("cannot acquire write lock: %w", err)
 	}
-	defer lock.Release()
+	defer lock.Release() //nolint:errcheck // advisory lock release on cleanup; error not actionable
 
 	inProcessLock := sm.getInProcessLock(state.Service)
 	inProcessLock.Lock()
@@ -442,7 +442,7 @@ func (sm *StateManager) DeleteRolloutState(service string) error {
 	if err != nil {
 		return fmt.Errorf("cannot acquire write lock: %w", err)
 	}
-	defer lock.Release()
+	defer lock.Release() //nolint:errcheck // advisory lock release on cleanup; error not actionable
 
 	inProcessLock := sm.getInProcessLock(service)
 	inProcessLock.Lock()

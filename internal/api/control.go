@@ -10,6 +10,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -106,7 +107,7 @@ func (cs *ControlServer) ListenAndServe(addr string) error {
 
 // Close shuts down the HTTP listener and rate limiter.
 func (cs *ControlServer) Close() error {
-	cs.rateLimiter.Close()
+	cs.rateLimiter.Close() //nolint:errcheck // rate-limiter close on shutdown; error not actionable
 	if cs.ln != nil {
 		return cs.ln.Close()
 	}
@@ -335,6 +336,7 @@ func (cs *ControlServer) listBackends(w http.ResponseWriter, _ *http.Request) {
 		ID       string `json:"id"`
 		Addr     string `json:"addr"`
 		Draining bool   `json:"draining"`
+		State    string `json:"state"`
 		Requests uint64 `json:"requests"`
 	}
 	rows := make([]row, len(all))
@@ -343,6 +345,7 @@ func (cs *ControlServer) listBackends(w http.ResponseWriter, _ *http.Request) {
 			ID:       b.ID,
 			Addr:     b.Addr,
 			Draining: b.Draining,
+			State:    string(b.State),
 			Requests: b.MarshalledRequests(),
 		}
 	}
@@ -452,7 +455,9 @@ func (cs *ControlServer) auth(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusUnauthorized, "Bearer token required", "unauthorized")
 			return
 		}
-		if strings.TrimPrefix(authHeader, "Bearer ") != cs.token {
+		provided := strings.TrimPrefix(authHeader, "Bearer ")
+		// Constant-time compare to avoid leaking the token via timing.
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(cs.token)) != 1 {
 			writeErr(w, http.StatusForbidden, "invalid token", "forbidden")
 			return
 		}
@@ -486,10 +491,10 @@ func clientIP(r *http.Request) string {
 		ips := strings.Split(xff, ",")
 		return strings.TrimSpace(ips[0])
 	}
-	// Fall back to RemoteAddr.
-	parts := strings.Split(r.RemoteAddr, ":")
-	if len(parts) > 0 {
-		return parts[0]
+	// Fall back to RemoteAddr. Use SplitHostPort so IPv6 addresses
+	// (e.g. "[::1]:54321") yield the real host, not a bare "[".
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
 	}
 	return r.RemoteAddr
 }

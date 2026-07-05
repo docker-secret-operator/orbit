@@ -41,7 +41,7 @@ func NewDockerRecoverySourceWithConfig(proxyInstance string, log *zap.Logger, tc
 	// Validate Docker daemon is available.
 	_, err = cl.Ping(context.Background())
 	if err != nil {
-		cl.Close()
+		cl.Close() //nolint:errcheck // docker client teardown; close error not actionable
 		return nil, fmt.Errorf("docker daemon unavailable: %w", err)
 	}
 
@@ -275,7 +275,7 @@ func (d *DockerRecoverySource) extractBackend(ctx context.Context, c types.Conta
 // Close closes the Docker client and health validator.
 func (d *DockerRecoverySource) Close() error {
 	if d.healthValidator != nil {
-		d.healthValidator.Close()
+		d.healthValidator.Close() //nolint:errcheck // health validator teardown; close error not actionable
 	}
 	if d.client != nil {
 		return d.client.Close()

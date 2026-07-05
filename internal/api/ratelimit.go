@@ -72,7 +72,7 @@ func (rl *RateLimiter) evictOldest() {
 	}
 
 	var oldest string
-	var oldestTime time.Time = time.Now()
+	oldestTime := time.Now()
 
 	for ip, t := range rl.lastSeen {
 		if t.Before(oldestTime) {

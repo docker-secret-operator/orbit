@@ -15,7 +15,33 @@ type Proxy struct {
 	TotalConns  atomic.Uint64 // lifetime connections accepted
 	ActiveConns atomic.Int64  // currently open connections
 	FailedConns atomic.Uint64 // connections that could not reach a backend
-	startTime   time.Time
+
+	// Passive-failover infrastructure counters (WP-B1). Advisory: incremented
+	// by the Runtime Registry and Router; no retry behavior acts on them yet.
+	DialFailures         atomic.Uint64 // dial failures reported to the registry
+	CandidateSelections  atomic.Uint64 // router candidate-set selections
+	CandidateExhaustions atomic.Uint64 // selections that found no active backend
+
+	// Continuous health-controller counters (WP-C).
+	HealthChecks        atomic.Uint64 // health probes performed
+	HealthFailures      atomic.Uint64 // health probes that failed
+	BackendStateChanges atomic.Uint64 // health-driven state transitions
+	UnhealthyBackends   atomic.Int64  // current unhealthy backend count (gauge)
+
+	// Runtime activation-gate counters (WP-C.5). Describe runtime readiness, not health.
+	ActivationAttempts     atomic.Uint64 // feature activation attempts
+	FeatureBlocked         atomic.Uint64 // activations blocked by missing prerequisites
+	FeaturesEnabled        atomic.Int64  // currently-enabled runtime features (gauge)
+	ZeroBackendProtections atomic.Uint64 // demotions refused to preserve availability
+
+	// Passive-failover execution counters (WP-B2).
+	FailoverAttempts  atomic.Uint64 // retry attempts made
+	FailoverSuccess   atomic.Uint64 // retries that connected
+	FailoverExhausted atomic.Uint64 // requests with no reachable candidate
+	RetryLatencyNanos atomic.Uint64 // summed retry latency (ns)
+	RetryLatencyCount atomic.Uint64 // number of retry-latency samples
+
+	startTime time.Time
 }
 
 // New returns a Proxy with the clock started at construction time.
@@ -40,6 +66,54 @@ func (p *Proxy) ConnFailed() {
 	p.FailedConns.Add(1)
 }
 
+// IncDialFailures records one dial failure reported to the runtime registry.
+func (p *Proxy) IncDialFailures() { p.DialFailures.Add(1) }
+
+// IncCandidateSelection records one router candidate-set selection.
+func (p *Proxy) IncCandidateSelection() { p.CandidateSelections.Add(1) }
+
+// IncCandidateExhaustion records one selection that found no active backend.
+func (p *Proxy) IncCandidateExhaustion() { p.CandidateExhaustions.Add(1) }
+
+// IncHealthChecks records one health probe performed by the Health Controller.
+func (p *Proxy) IncHealthChecks() { p.HealthChecks.Add(1) }
+
+// IncHealthFailures records one failed health probe.
+func (p *Proxy) IncHealthFailures() { p.HealthFailures.Add(1) }
+
+// IncBackendStateChanges records one health-driven backend state transition.
+func (p *Proxy) IncBackendStateChanges() { p.BackendStateChanges.Add(1) }
+
+// SetUnhealthyBackends sets the current unhealthy-backend gauge.
+func (p *Proxy) SetUnhealthyBackends(n int) { p.UnhealthyBackends.Store(int64(n)) }
+
+// IncActivationAttempts records one runtime-feature activation attempt.
+func (p *Proxy) IncActivationAttempts() { p.ActivationAttempts.Add(1) }
+
+// IncFeatureBlocked records one activation blocked by missing prerequisites.
+func (p *Proxy) IncFeatureBlocked() { p.FeatureBlocked.Add(1) }
+
+// SetFeaturesEnabled sets the currently-enabled runtime-feature gauge.
+func (p *Proxy) SetFeaturesEnabled(n int) { p.FeaturesEnabled.Store(int64(n)) }
+
+// IncZeroBackendProtection records one demotion refused to preserve availability.
+func (p *Proxy) IncZeroBackendProtection() { p.ZeroBackendProtections.Add(1) }
+
+// IncFailoverAttempts records one passive-failover retry attempt.
+func (p *Proxy) IncFailoverAttempts() { p.FailoverAttempts.Add(1) }
+
+// IncFailoverSuccess records one retry that connected.
+func (p *Proxy) IncFailoverSuccess() { p.FailoverSuccess.Add(1) }
+
+// IncFailoverExhausted records one request with no reachable candidate.
+func (p *Proxy) IncFailoverExhausted() { p.FailoverExhausted.Add(1) }
+
+// AddRetryLatency records the elapsed time of one successful failover.
+func (p *Proxy) AddRetryLatency(d time.Duration) {
+	p.RetryLatencyNanos.Add(uint64(d.Nanoseconds()))
+	p.RetryLatencyCount.Add(1)
+}
+
 // WritePrometheus writes Prometheus text-format metrics to w.
 // backends and activeBackends are the current registry totals (caller-supplied).
 func (p *Proxy) WritePrometheus(w io.Writer, backends, activeBackends int) {
@@ -56,6 +130,54 @@ func (p *Proxy) WritePrometheus(w io.Writer, backends, activeBackends int) {
 
 	metric("TCP connections that could not reach a backend", "counter",
 		"orbit_connections_failed_total", p.FailedConns.Load())
+
+	metric("Dial failures reported to the runtime registry (advisory; not yet acted on)", "counter",
+		"orbit_dial_failures_total", p.DialFailures.Load())
+
+	metric("Router candidate-set selections performed", "counter",
+		"orbit_candidate_selection_total", p.CandidateSelections.Load())
+
+	metric("Router candidate selections that found no active backend", "counter",
+		"orbit_candidate_exhaustion_total", p.CandidateExhaustions.Load())
+
+	metric("Health probes performed by the health controller", "counter",
+		"orbit_health_checks_total", p.HealthChecks.Load())
+
+	metric("Health probes that failed", "counter",
+		"orbit_health_failures_total", p.HealthFailures.Load())
+
+	metric("Health-driven backend state transitions", "counter",
+		"orbit_backend_state_changes_total", p.BackendStateChanges.Load())
+
+	metric("Backends currently in the unhealthy state", "gauge",
+		"orbit_backends_unhealthy", p.UnhealthyBackends.Load())
+
+	metric("Runtime-feature activation attempts", "counter",
+		"orbit_runtime_activation_attempts_total", p.ActivationAttempts.Load())
+
+	metric("Runtime-feature activations blocked by missing prerequisites", "counter",
+		"orbit_runtime_feature_blocked_total", p.FeatureBlocked.Load())
+
+	metric("Currently-enabled runtime features", "gauge",
+		"orbit_runtime_features_enabled", p.FeaturesEnabled.Load())
+
+	metric("Backend demotions refused by zero-backend protection", "counter",
+		"orbit_zero_backend_protection_total", p.ZeroBackendProtections.Load())
+
+	metric("Passive-failover retry attempts", "counter",
+		"orbit_failover_attempts_total", p.FailoverAttempts.Load())
+
+	metric("Passive-failover retries that connected", "counter",
+		"orbit_failover_success_total", p.FailoverSuccess.Load())
+
+	metric("Requests with no reachable candidate backend", "counter",
+		"orbit_failover_exhausted_total", p.FailoverExhausted.Load())
+
+	metric("Summed passive-failover retry latency in seconds", "counter",
+		"orbit_retry_latency_seconds_sum", fmt.Sprintf("%.6f", float64(p.RetryLatencyNanos.Load())/1e9))
+
+	metric("Passive-failover retry-latency sample count", "counter",
+		"orbit_retry_latency_seconds_count", p.RetryLatencyCount.Load())
 
 	metric("Total registered backends including draining ones", "gauge",
 		"orbit_backends_total", backends)
