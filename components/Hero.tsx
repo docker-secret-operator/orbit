@@ -1,42 +1,58 @@
+import type { CSSProperties } from "react";
 import { site } from "@/lib/site";
 import Terminal from "./Terminal";
 import CopyButton from "./CopyButton";
 import { GitHubIcon, BookIcon } from "./icons";
 import styles from "./Hero.module.css";
 
+// Page-load entrance sequence: each block reveals in reading order, the
+// terminal panel is offset to land alongside the copy rather than after it.
+// CSS-driven (see the .reveal keyframe in Hero.module.css) so there's no
+// client JS cost and no hydration risk — prefers-reduced-motion disables it.
+function delay(ms: number): CSSProperties {
+  return { "--reveal-delay": `${ms}ms` } as CSSProperties;
+}
+
 export default function Hero() {
   return (
     <section className={styles.hero} aria-labelledby="hero-title">
       <div className={`container ${styles.grid}`}>
         <div className={styles.copy}>
-          <p className={styles.badge}>
+          <p className={`${styles.badge} ${styles.reveal}`} style={delay(0)}>
             <span className={styles.dot} aria-hidden />
             Docker CLI plugin · MIT licensed
           </p>
 
-          <h1 id="hero-title" className={styles.title}>
+          <h1
+            id="hero-title"
+            className={`${styles.title} ${styles.reveal}`}
+            style={delay(60)}
+          >
             Zero-downtime deploys for Docker&nbsp;Compose.
           </h1>
 
-          <p className={styles.lead}>
+          <p className={`${styles.lead} ${styles.reveal}`} style={delay(120)}>
             Orbit is a single binary that gives your existing Compose stack
             health-aware rolling updates — so recreating a container never drops
             a connection.
           </p>
 
-          <p className={styles.sub}>
+          <p className={`${styles.sub} ${styles.reveal}`} style={delay(180)}>
             No Kubernetes. No Traefik or nginx to run. No rewrite of your{" "}
             <code>docker-compose.yml</code>. Drop the binary next to your stack
             and the host port never goes dark again — not during deploys, not
             during restarts.
           </p>
 
-          <div className={styles.installRow}>
+          <div
+            className={`${styles.installRow} ${styles.reveal}`}
+            style={delay(240)}
+          >
             <code className={styles.install}>{site.installScript}</code>
             <CopyButton value={site.installScript} />
           </div>
 
-          <div className={styles.actions}>
+          <div className={`${styles.actions} ${styles.reveal}`} style={delay(300)}>
             <a
               className="btn btn-primary"
               href={site.repo}
@@ -52,7 +68,7 @@ export default function Hero() {
             </a>
           </div>
 
-          <dl className={styles.status}>
+          <dl className={`${styles.status} ${styles.reveal}`} style={delay(360)}>
             <div>
               <dt>License</dt>
               <dd>{site.status.license}</dd>
@@ -78,7 +94,7 @@ export default function Hero() {
           </dl>
         </div>
 
-        <div className={styles.demo}>
+        <div className={`${styles.demo} ${styles.reveal}`} style={delay(150)}>
           <Terminal
             title="deploy v2"
             lines={[
@@ -87,6 +103,7 @@ export default function Hero() {
               { k: "out", t: "→ starting new backend    web  (2.0.0)" },
               { k: "ok", t: "✓ health check passed     web  (2.0.0)" },
               { k: "out", t: "→ registered with proxy   POST /backends" },
+              { k: "ok", t: "✓ stability check passed  web  (2.0.0)" },
               { k: "out", t: "→ draining old backend    web  (1.0.0)" },
               { k: "blank" },
               { k: "ok", t: "✓ rollout complete        0 connections dropped" },

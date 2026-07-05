@@ -1,0 +1,20 @@
+<svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Orbit">
+  <circle cx="12" cy="12" r="3" fill="#1263e0" />
+  <ellipse
+    cx="12"
+    cy="12"
+    rx="10"
+    ry="4.5"
+    stroke="#0b0d0e"
+    stroke-width="1.6"
+    transform="rotate(32 12 12)"
+  />
+  <circle
+    cx="20.1"
+    cy="7.4"
+    r="1.7"
+    fill="#ffffff"
+    stroke="#0b0d0e"
+    stroke-width="1.6"
+  />
+</svg>
