@@ -37,11 +37,14 @@ docker-orbit rollout <service>:
   3. Wait for new container's healthcheck
   4. POST /backends → register new container with proxy
   5. Persist rollback state (/tmp/orbit-<service>-state.json)
-  6. PUT /backends/{old}/drain → stop routing new connections to old
-  7. Wait drain period (in-flight requests on old container finish)
-  8. DELETE /backends/{old} → deregister
-  9. Scale back to original count (old container removed)
-  10. Clear rollback state
+  6. Watch the new backend for a stability window (--stability, default 10s);
+     on failure, roll back automatically (see Amendment below) instead of
+     continuing to step 7
+  7. PUT /backends/{old}/drain → stop routing new connections to old
+  8. Wait drain period (in-flight requests on old container finish)
+  9. DELETE /backends/{old} → deregister
+  10. Scale back to original count (old container removed)
+  11. Clear rollback state
 
 Crash recovery (proxy startup):
   Load persisted (ActiveGenerationState, RolloutState)
@@ -120,6 +123,38 @@ Crash recovery (proxy startup):
 
 ---
 
+## Amendment (2026-07-05): Post-Switch Stability Verification & Canonical Step Definitions
+
+**Status:** Implemented
+
+Two refinements to the rollout engine above, made after review surfaced two gaps in the original design. Both are additive — the ten-step sequence this ADR already documents is otherwise unchanged.
+
+### Decision 1 — Post-Switch Stability Verification
+
+**Problem:** The original design verified the new container's health exactly once — via Docker's own healthcheck, before registering it with the proxy (step 3). Once registered, nothing checked whether the backend kept serving correctly. A container that passed its healthcheck but became unhealthy moments after taking traffic would go undetected until the old backend had already been drained and removed, at which point there was nothing left to roll back to.
+
+**Why health checks alone were insufficient:** A Docker healthcheck answers "is this container alive right now?", not "is this deployment safe to keep?". The two questions coincide at the moment of registration but can diverge immediately after, under real traffic, resource contention, or a slow-starting dependency.
+
+**Decision:** `rollout.Run` now watches the new container for a configurable `StabilityWindow` (`--stability`, default 10s) immediately after registering it and persisting rollback state (new step 6, `PhaseVerifying`), and *before* draining the old backend (step 7). If the container becomes unhealthy or stops running during that window, the rollout rolls back automatically (`PhaseRollingBack`): it deregisters and removes only the new (bad) backend and reconciles the replica count. The old backend needs no restoration, because it was never touched — verify-before-drain ordering is what makes this rollback safe without manual intervention.
+
+**Operational benefit:** A deployment that destabilizes within the stability window now self-heals without an operator needing to notice and run `docker-orbit rollback` by hand. Passing `--stability 0` disables the check for callers who want the original step-3-only verification behavior.
+
+### Decision 2 — Canonical Deployment Step Definitions
+
+**Problem:** The step list shown by `docker-orbit deploy --dry-run` was a hand-maintained string literal in `cmd/docker-orbit/deploy.go`, kept in sync with `rollout.Run`'s actual sequence only by comment convention. This is exactly the drift risk "documentation must match implementation" guards against, and it already happened once: the stability-window step above was added to `Run` without the CLI's copy being updated in the same pass.
+
+**Decision:** `rollout.PlannedSteps()` is now the single source of truth for step descriptions — an ordered list pairing each `Phase` `Run` reports through `Options.Progress` with a human-readable description. The CLI's dry-run preview is generated from this list (plus one CLI-only entry for acquiring the deployment lock, which happens before `Run` is called and has no `Phase`) instead of maintaining an independent copy.
+
+**Why this prevents drift:** There is now exactly one place that knows what `Run` does. `TestPlannedStepsCoversEveryReportedPhase` asserts every reportable `Phase` has exactly one entry in `PlannedSteps()`; the CLI preview updates automatically from it. Dry-run output and actual execution cannot silently diverge the way they did before.
+
+### Verification
+
+- `internal/rollout`: `TestFailureInjection_StabilityCheckFails_AutoRollsBackAndKeepsOldBackend` (auto-rollback path) and `TestPlannedStepsCoversEveryReportedPhase` (single-source-of-truth contract) added; full existing suite (including all prior failure-injection tests) passes unchanged under `go test ./internal/rollout/... -race`.
+- `cmd/docker-orbit`: `TestRunDeploy_DryRun_ShowsPlanFromLiveStatus` passes against the generated (not hand-copied) step list.
+- `go build ./...`, `go vet ./...`, and `gofmt -l` are clean on every file touched by this amendment.
+
+---
+
 ## Related ADRs
 
 - ADR-0001 (Orbit Brand Freeze)
@@ -140,3 +175,4 @@ Crash recovery (proxy startup):
 | Date | Author | Change |
 |------|--------|--------|
 | 2026-07-02 | Md Umair (with Claude Code) | Initial backfill, documenting the existing recovery/rollout/proxy architecture and its one known correctness gap |
+| 2026-07-05 | Md Umair (with Claude Code) | Amendment: documented post-switch stability verification (auto-rollback before the old backend is touched) and `rollout.PlannedSteps()` as the canonical source for deployment step descriptions; updated the Design Overview step list from 10 to 11 steps to match |

@@ -66,6 +66,7 @@ Example:
 	cmd.Flags().BoolVar(&opts.Pull, "pull", false, "Pull latest image before deploying")
 	cmd.Flags().DurationVarP(&opts.Timeout, "timeout", "t", 60*time.Second, "Healthcheck timeout")
 	cmd.Flags().DurationVarP(&opts.Drain, "drain", "d", 5*time.Second, "Drain period before removing old container")
+	cmd.Flags().DurationVar(&opts.StabilityWindow, "stability", 10*time.Second, "How long to watch the new backend before draining the old one; auto-rolls back if it fails")
 	cmd.Flags().StringVar(&opts.ControlAddr, "control-addr", "http://localhost:9900", "Proxy control API address")
 	cmd.Flags().StringVar(&opts.APIToken, "api-token", os.Getenv("ORBIT_API_TOKEN"), "Control API bearer token")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show the deployment plan without executing it")
@@ -88,6 +89,7 @@ type DeployPlan struct {
 	Steps             []string `json:"steps"`
 	Timeout           string   `json:"timeout"`
 	Drain             string   `json:"drain"`
+	Stability         string   `json:"stability"`
 	PreflightChecks   []Check  `json:"preflight_checks"`
 	PreflightPassed   bool     `json:"preflight_passed"`
 }
@@ -106,18 +108,18 @@ type DeployResult struct {
 	UnhealthyBackends  int    `json:"unhealthy_backends"`
 }
 
-// deploySteps mirrors rollout.Run's own documented step sequence — shown in
-// the plan preview as exactly what will happen, not a guess. Keep this in
-// sync with rollout.Run's doc comment; it describes the same fixed sequence.
-var deploySteps = []string{
-	"Acquire deployment lock (prevents a concurrent deploy for this service)",
-	"Optional: pull the new image (--pull)",
-	"Scale the service +1 (start the new container alongside the old one)",
-	"Wait for the new container's healthcheck to pass (or --timeout)",
-	"Register the new container with the proxy — traffic starts splitting",
-	"Save rollback state (enables 'docker orbit rollback' if this fails)",
-	"Drain the old container for --drain, then remove it",
-	"Deregister the old backend and the initial seed backend",
+// deploySteps returns the plan preview shown for --dry-run and the
+// confirmation prompt. Acquiring the lock is the CLI's own responsibility
+// (not part of rollout.Run — see its doc comment), so it's prepended here;
+// everything Run itself does comes from rollout.PlannedSteps, the single
+// source of truth for that sequence, so this list can no longer drift out of
+// sync with what Run actually executes.
+func deploySteps() []string {
+	steps := []string{"Acquire deployment lock (prevents a concurrent deploy for this service)"}
+	for _, s := range rollout.PlannedSteps() {
+		steps = append(steps, s.Description)
+	}
+	return steps
 }
 
 func runDeploy(cmd *cobra.Command, p *output.Printer, opts rollout.Options, project string, dryRun, yes, forceUnlock bool, log *zap.Logger) error {
@@ -147,9 +149,10 @@ func runDeploy(cmd *cobra.Command, p *output.Printer, opts rollout.Options, proj
 	plan := DeployPlan{
 		Service:         opts.Service,
 		ComposeFile:     opts.ComposeFile,
-		Steps:           deploySteps,
+		Steps:           deploySteps(),
 		Timeout:         opts.Timeout.String(),
 		Drain:           opts.Drain.String(),
+		Stability:       opts.StabilityWindow.String(),
 		PreflightChecks: report.Checks,
 		PreflightPassed: preflightOK,
 	}
@@ -220,7 +223,7 @@ func runDeploy(cmd *cobra.Command, p *output.Printer, opts rollout.Options, proj
 		e := clierr.Wrap(err, output.ExitError, "could not acquire deployment lock", "Check for a stale lock file, or pass --force-unlock after verifying no other deploy is running")
 		return renderCLIErr(p, e)
 	}
-	defer lock.Release()
+	defer lock.Release() //nolint:errcheck // deferred lock release on exit; error not actionable
 
 	opts.Progress = func(phase rollout.Phase, detail string) {
 		p.Human(func(w io.Writer) { fmt.Fprintf(w, "  → [%s] %s\n", phase, detail) })
@@ -301,6 +304,7 @@ func renderDeployPlanHuman(w io.Writer, plan DeployPlan) {
 	fmt.Fprintf(tw, "Unhealthy backends:\t%d\n", plan.UnhealthyBackends)
 	fmt.Fprintf(tw, "Healthcheck timeout:\t%s\n", plan.Timeout)
 	fmt.Fprintf(tw, "Drain period:\t%s\n", plan.Drain)
+	fmt.Fprintf(tw, "Stability window:\t%s\n", plan.Stability)
 	_ = tw.Flush()
 
 	fmt.Fprintln(w, "\nSteps that will run:")

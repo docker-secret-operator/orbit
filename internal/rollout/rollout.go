@@ -37,6 +37,14 @@ type Options struct {
 	// old container after the new one is healthy. Default: 5 seconds.
 	Drain time.Duration
 
+	// StabilityWindow is how long to watch the new backend after it is
+	// registered but before the old backend is touched. If the new backend
+	// becomes unhealthy or its container stops running during this window,
+	// the rollout is rolled back automatically (the old backend was never
+	// drained or removed, so recovery is limited to removing the new
+	// backend). Zero or negative disables the check. Default: 10 seconds.
+	StabilityWindow time.Duration
+
 	// ControlAddr is the HTTP address of the Orbit proxy control API.
 	// Default: "http://localhost:9900"
 	ControlAddr string
@@ -64,10 +72,43 @@ const (
 	PhaseScalingUp     Phase = "scaling_up"    // Step 2: scale +1
 	PhaseHealthCheck   Phase = "health_check"  // Step 3: wait for new container healthy
 	PhaseRegistering   Phase = "registering"   // Step 5: register new backend
+	PhaseSavingState   Phase = "saving_state"  // Step 6: persist rollback state
+	PhaseVerifying     Phase = "verifying"     // Step 6b: post-registration stability check
+	PhaseRollingBack   Phase = "rolling_back"  // Step 6b: automatic rollback if stability check fails
 	PhaseDraining      Phase = "draining"      // Step 7: drain old backend
 	PhaseDeregistering Phase = "deregistering" // Step 8-9b: remove old backend/container/seed
 	PhaseComplete      Phase = "complete"      // Step 10: state cleared, rollout done
 )
+
+// StepDescription pairs a Phase with a human-readable description of what
+// happens during it. See PlannedSteps.
+type StepDescription struct {
+	Phase       Phase
+	Description string
+}
+
+// PlannedSteps describes, in order, every phase Run reports through
+// Options.Progress. It is the single source of truth for previewing a
+// rollout (e.g. `docker orbit deploy --dry-run`) — callers should build their
+// preview from this instead of hand-copying Run's step sequence, which drifts
+// silently the moment Run changes and the copy doesn't (this happened once
+// already, when StabilityWindow was added).
+//
+// Not included: steps a caller performs itself, outside Run — acquiring the
+// per-service deployment lock is the caller's responsibility (see Run's doc
+// comment), so it has no Phase and isn't part of this list.
+func PlannedSteps() []StepDescription {
+	return []StepDescription{
+		{PhasePulling, "Optional: pull the new image (--pull)"},
+		{PhaseScalingUp, "Scale the service +1 (start the new container alongside the old one)"},
+		{PhaseHealthCheck, "Wait for the new container's healthcheck to pass (or --timeout)"},
+		{PhaseRegistering, "Register the new container with the proxy — traffic starts splitting"},
+		{PhaseSavingState, "Save rollback state (enables 'docker orbit rollback' if this fails)"},
+		{PhaseVerifying, "Watch the new container for --stability before touching the old one (auto-rolls back on failure)"},
+		{PhaseDraining, "Drain the old container for --drain, then remove it"},
+		{PhaseDeregistering, "Deregister the old backend and the initial seed backend"},
+	}
+}
 
 // ProgressFunc receives phase transitions during Run. detail is a short,
 // human-readable elaboration (e.g. a container ID or duration) — the same
@@ -91,6 +132,9 @@ func (o *Options) defaults() {
 	}
 	if o.Drain == 0 {
 		o.Drain = 5 * time.Second
+	}
+	if o.StabilityWindow == 0 {
+		o.StabilityWindow = 10 * time.Second
 	}
 	if o.ControlAddr == "" {
 		o.ControlAddr = "http://localhost:9900"
@@ -124,6 +168,12 @@ type Runtime interface {
 	FindOldContainer(ctx context.Context, service, newID string) (string, error)
 	ContainerAddr(ctx context.Context, id string) (string, error)
 	RemoveContainer(ctx context.Context, id string) error
+
+	// VerifyStable watches containerID for window and returns an error the
+	// moment it becomes unhealthy or stops running. It returns nil once the
+	// full window elapses without either. window <= 0 means "no check" —
+	// implementations must return nil immediately in that case.
+	VerifyStable(ctx context.Context, containerID string, window time.Duration) error
 }
 
 // ControlAPI abstracts rollout calls to the proxy control plane.
@@ -175,46 +225,32 @@ func clearState(service string) {
 	os.Remove(statePath(service)) //nolint:errcheck
 }
 
-// ── Mutual exclusion ──────────────────────────────────────────────────────────
-
-// lockRollout prevents concurrent rollouts for the same service by creating an
-// exclusive lock file. Returns an unlock function on success.
-func lockRollout(service string) (func(), error) {
-	lockPath := fmt.Sprintf("/tmp/orbit-%s.lock", service)
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		if os.IsExist(err) {
-			return nil, fmt.Errorf("rollout already in progress for %q (lock: %s) — wait or remove if stale", service, lockPath)
-		}
-		return nil, fmt.Errorf("rollout: acquire lock: %w", err)
-	}
-	f.Close()
-	return func() { os.Remove(lockPath) }, nil //nolint:errcheck
-}
-
 // ── Run ───────────────────────────────────────────────────────────────────────
 
 // Run executes a zero-downtime rolling update for the given service.
 //
+// Mutual exclusion is the caller's responsibility: callers (the deploy and
+// rollout CLI commands) acquire the per-service lock via AcquireLock before
+// invoking Run, which also lets them offer --force-unlock and stale-lock
+// detection. Run must NOT acquire its own lock — doing so would collide with
+// the caller's lock on the same /tmp/orbit-<service>.lock path and fail every
+// real deployment with a false "already in progress" error.
+//
 // Steps:
-//  1. Acquire exclusive lock (prevents concurrent rollouts for this service).
-//  2. Optionally pull the new image.
-//  3. Scale the service to +1 instance (docker compose up --scale).
-//  4. Wait for the new container's healthcheck to pass (or timeout).
-//  5. Register the new container with the proxy via POST /backends.
-//  6. Persist rollout state to /tmp (enables rollback).
+//  1. Optionally pull the new image.
+//  2. Scale the service to +1 instance (docker compose up --scale).
+//  3. Wait for the new container's healthcheck to pass (or timeout).
+//  4. Register the new container with the proxy via POST /backends.
+//  5. Persist rollout state to /tmp (enables rollback).
+//  6. Watch the new container for StabilityWindow; if it becomes unhealthy
+//     or stops running, roll back automatically (remove the new backend —
+//     the old one was never touched) and return an error.
 //  7. Drain old container; wait drain period so in-flight requests complete.
 //  8. Deregister the old container via DELETE /backends/{id}.
 //  9. Scale back to the original count (remove old container).
 //  10. Clear rollout state.
 func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 	opts.defaults()
-
-	unlock, err := lockRollout(opts.Service)
-	if err != nil {
-		return err
-	}
-	defer unlock()
 
 	start := time.Now()
 	if err := history.Append(history.Event{Service: opts.Service, Type: history.EventRolloutStarted}); err != nil {
@@ -300,6 +336,7 @@ func runWithDeps(ctx context.Context, opts Options, log *zap.Logger, deps runDep
 		zap.String("addr", newAddr))
 
 	// ── Step 6: Persist rollout state (enables rollback) ─────────────────
+	opts.report(PhaseSavingState, "saving rollback state for "+opts.Service)
 	oldBackendID := ""
 	oldAddr := ""
 	if oldID != "" {
@@ -319,6 +356,31 @@ func runWithDeps(ctx context.Context, opts Options, log *zap.Logger, deps runDep
 		Drain:        opts.Drain,
 		StartedAt:    time.Now(),
 	})
+
+	// ── Step 6b: Verify new backend stability before touching the old one ──
+	// The old backend has not been drained or removed yet — it is still
+	// fully serving. If the new backend is unstable, recovery only needs to
+	// remove the new backend; nothing needs to be restored.
+	opts.report(PhaseVerifying, fmt.Sprintf("watching %s for %s before draining %s", newBackendID, opts.StabilityWindow, nonEmptyOr(oldBackendID, "(no prior backend)")))
+	if err := deps.runtime.VerifyStable(ctx, newID, opts.StabilityWindow); err != nil {
+		log.Warn("rollout: new backend failed stability check — rolling back automatically",
+			zap.String("backend_id", newBackendID),
+			zap.Error(err))
+		opts.report(PhaseRollingBack, fmt.Sprintf("%s failed stability check: %v", newBackendID, err))
+
+		if derr := deps.control.DeregisterBackend(ctx, opts, newBackendID, log); derr != nil {
+			log.Warn("rollout: could not deregister failed backend during auto-rollback",
+				zap.String("id", newBackendID), zap.Error(derr))
+		}
+		_ = deps.runtime.RemoveContainer(ctx, newID)
+		if serr := deps.runtime.ScaleService(ctx, opts.ComposeFile, opts.Service, currentReplicas); serr != nil {
+			log.Warn("rollout: could not reconcile replica count after auto-rollback",
+				zap.Int("target_replicas", currentReplicas), zap.Error(serr))
+		}
+		deps.state.Clear(opts.Service)
+
+		return fmt.Errorf("rollout: new backend failed stability check, rolled back automatically (old backend %s never touched): %w", nonEmptyOr(oldBackendID, "(none)"), err)
+	}
 
 	// ── Step 7: Drain old connections ─────────────────────────────────────
 	log.Info("rollout: draining old connections", zap.Duration("drain", opts.Drain))
@@ -545,6 +607,10 @@ func (dockerRuntime) RemoveContainer(ctx context.Context, id string) error {
 	return exec.CommandContext(ctx, "docker", "rm", id).Run()
 }
 
+func (dockerRuntime) VerifyStable(ctx context.Context, containerID string, window time.Duration) error {
+	return verifyContainerStable(ctx, containerID, window)
+}
+
 type httpControlAPI struct{}
 
 func (httpControlAPI) RegisterBackend(ctx context.Context, opts Options, id, addr string, log *zap.Logger) error {
@@ -673,6 +739,61 @@ func inspectNewestHealthy(ctx context.Context, service string) (id, addr string,
 	}
 
 	return id, ip + ":" + port, nil
+}
+
+// stabilityProbeInterval is how often verifyContainerStable polls during the
+// stability window.
+const stabilityProbeInterval = 1 * time.Second
+
+// verifyContainerStable polls containerID's health/running state until
+// window elapses, failing fast the moment it becomes unhealthy or stops
+// running. window <= 0 skips the check entirely (returns nil immediately).
+func verifyContainerStable(ctx context.Context, containerID string, window time.Duration) error {
+	if window <= 0 {
+		return nil
+	}
+	deadline := time.Now().Add(window)
+	ticker := time.NewTicker(stabilityProbeInterval)
+	defer ticker.Stop()
+
+	for {
+		status, running, err := inspectHealthAndRunning(ctx, containerID)
+		if err != nil {
+			return fmt.Errorf("inspect during stability check: %w", err)
+		}
+		if !running {
+			return fmt.Errorf("container %s stopped running during stability window", shortID(containerID))
+		}
+		if status == "unhealthy" {
+			return fmt.Errorf("container %s became unhealthy during stability window", shortID(containerID))
+		}
+		if !time.Now().Before(deadline) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// inspectHealthAndRunning returns a container's Docker healthcheck status
+// (empty string if no HEALTHCHECK is defined, mirroring inspectNewestHealthy's
+// treatment) and whether it is currently running.
+func inspectHealthAndRunning(ctx context.Context, id string) (status string, running bool, err error) {
+	out, err := exec.CommandContext(ctx, "docker", "inspect",
+		"--format", `{{.State.Health.Status}}|{{.State.Running}}`,
+		id,
+	).Output()
+	if err != nil {
+		return "", false, fmt.Errorf("docker inspect %s: %w", id, err)
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(out)), "|", 2)
+	if len(parts) != 2 {
+		return "", false, fmt.Errorf("docker inspect %s: unexpected output %q", id, string(out))
+	}
+	return parts[0], parts[1] == "true", nil
 }
 
 // findOldContainer returns the ID of the container that is NOT the newID.

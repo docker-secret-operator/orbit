@@ -169,16 +169,20 @@ Steps:
   4. Wait for new container healthcheck to pass
   5. Register new container with the docker-rollout proxy
   6. Save rollout state to /tmp (enables rollback if deploy fails)
-  7. Drain period — in-flight requests complete on old container
-  8. Deregister old container from proxy
-  9. Scale back to original count
+  7. Watch the new container for --stability before touching the old one
+  8. Drain period — in-flight requests complete on old container
+  9. Deregister old container from proxy
+  10. Scale back to original count
 
 If the new container fails its healthcheck within --timeout, docker-orbit scales
-back to 1 automatically without disrupting traffic.
+back to 1 automatically without disrupting traffic. If it fails during the
+--stability window (after being registered but before the old container is
+touched), docker-orbit rolls back automatically — the old container was never
+drained, so nothing needs to be restored.
 
 Example:
   docker-orbit rollout web
-  docker-orbit rollout web --pull --timeout 120s --drain 10s`,
+  docker-orbit rollout web --pull --timeout 120s --drain 10s --stability 15s`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.Service = args[0]
@@ -197,7 +201,7 @@ Example:
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 				return err
 			}
-			defer lock.Release()
+			defer lock.Release() //nolint:errcheck // deferred lock release on exit; error not actionable
 
 			// Verify the service exists in docker-rollout-compose.yml.
 			cf, err := compose.ParseFile(opts.ComposeFile)
@@ -221,6 +225,7 @@ Example:
 	cmd.Flags().BoolVar(&opts.Pull, "pull", false, "Pull latest image before rolling out")
 	cmd.Flags().DurationVarP(&opts.Timeout, "timeout", "t", 60*time.Second, "Healthcheck timeout")
 	cmd.Flags().DurationVarP(&opts.Drain, "drain", "d", 5*time.Second, "Drain period before removing old container")
+	cmd.Flags().DurationVar(&opts.StabilityWindow, "stability", 10*time.Second, "How long to watch the new backend before draining the old one; auto-rolls back if it fails")
 	cmd.Flags().StringVar(&opts.ControlAddr, "control-addr", "http://localhost:9900", "Proxy control API address")
 	cmd.Flags().StringVar(&opts.APIToken, "api-token", os.Getenv("ORBIT_API_TOKEN"), "Control API bearer token")
 	cmd.Flags().BoolVar(&forceUnlock, "force-unlock", false, "Force unlock if previous process died (ONLY use after verifying process is gone)")
@@ -285,6 +290,8 @@ func runProxy(log *zap.Logger, version string) error {
 	// Create proxy server.
 	reg := proxy.NewRegistry()
 	router := proxy.NewRouter(reg)
+	reg.SetMetrics(m)
+	router.SetMetrics(m)
 	srv := proxy.NewServer(router, log, m)
 
 	// Bind ports.
@@ -314,7 +321,7 @@ func runProxy(log *zap.Logger, version string) error {
 			log.Error("control API stopped", zap.Error(err))
 		}
 	}()
-	defer controlSrv.Close()
+	defer controlSrv.Close() //nolint:errcheck // deferred control-server close on shutdown; error not actionable
 
 	// PHASE 3: Generation-centric recovery with persistent state.
 	// Mark as recovering immediately so readiness probe reflects boot state.
@@ -360,6 +367,26 @@ func runProxy(log *zap.Logger, version string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(),
 		syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
+
+	// ── Runtime capability activation (WP-B2) ────────────────────────────
+	// Passive-failover execution now exists, so the Continuous Health
+	// Controller may be activated — but ONLY through the Runtime Feature Gate,
+	// which deterministically enforces every prerequisite. No direct startup
+	// wiring bypasses the gate (Runtime Constitution activation model).
+	features := proxy.NewRuntimeFeatures(m)
+	if err := features.Enable(proxy.FeatureContinuousHealth, proxy.ImplementedPrerequisites()); err != nil {
+		log.Warn("runtime: continuous health NOT activated (prerequisites unmet)", zap.Error(err))
+	} else {
+		// Zero-backend protection: a refused demotion emits a warning + metric.
+		reg.SetZeroBackendHook(func(id string) {
+			m.IncZeroBackendProtection()
+			log.Warn("runtime: zero-backend protection kept the last active backend",
+				zap.String("backend", id))
+		})
+		hc := proxy.NewHealthController(reg, nil, proxy.DefaultHealthControllerConfig(), m, log)
+		go hc.Run(ctx) // stops when the shutdown signal cancels ctx
+		log.Info("runtime: continuous health controller activated via feature gate")
+	}
 
 	<-ctx.Done()
 
@@ -424,7 +451,7 @@ func executeRecovery(
 		// Proceed with empty inventory (state-only recovery)
 		startupState = proxy.StartupRecovering
 	} else {
-		defer source.Close()
+		defer source.Close() //nolint:errcheck // deferred source close; error not actionable
 
 		// Discover and validate backends with health checks.
 		recoveryResult, err = source.DiscoverAndValidateBackends(ctx)

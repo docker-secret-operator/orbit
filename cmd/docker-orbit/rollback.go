@@ -33,7 +33,7 @@ func rollbackCmd(log *zap.Logger) *cobra.Command {
 backend with the proxy, drains the new (failing) backend, and removes it.
 
 The rollout/deploy commands save a state file to
-/tmp/docker-rollout-<service>-state.json between the point the new backend is
+/tmp/orbit-<service>-state.json between the point the new backend is
 registered and the old one is removed. If the new deployment fails, run this
 command immediately to restore traffic.
 

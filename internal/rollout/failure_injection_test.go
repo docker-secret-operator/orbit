@@ -3,6 +3,7 @@ package rollout
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -132,5 +133,75 @@ func TestFailureInjection_ControlAPIUnavailableAtRegister_KeepsOldBackendServing
 	// keeps serving, which holds because drain/deregister were never reached.
 	if len(rt.scaleCalls) != 1 || rt.scaleCalls[0] != 2 {
 		t.Errorf("expected a single scale-up (+1) and no scale-back; scaleCalls=%v", rt.scaleCalls)
+	}
+}
+
+// Spec: "new backend fails its stability window". The new container passes
+// its initial healthcheck and gets registered, but becomes unhealthy (or
+// crashes) during the post-registration stability window — before the old
+// backend has been drained or removed. The engine must roll back
+// automatically: deregister and remove the new (bad) backend, reconcile
+// replica count, clear rollback state, and return an error — all without
+// ever draining or deregistering the OLD backend, which was serving the
+// whole time and needs no restoration.
+func TestFailureInjection_StabilityCheckFails_AutoRollsBackAndKeepsOldBackend(t *testing.T) {
+	rt := &fakeRuntime{
+		replicaCount:    1,
+		waitID:          "newcontainer1234",
+		waitAddr:        "10.0.0.2:80",
+		oldID:           "oldcontainer1234",
+		containerAddr:   "10.0.0.1:80",
+		verifyStableErr: errors.New("container newcontainer1234 became unhealthy during stability window"),
+	}
+	ctrl := &fakeControl{}
+	st := &fakeStateStore{}
+
+	err := runWithDeps(
+		context.Background(),
+		Options{
+			Service:         "api",
+			ComposeFile:     "docker-rollout-compose.yml",
+			ControlAddr:     "http://localhost:9900",
+			Drain:           0,
+			StabilityWindow: 10, // any non-zero value; fakeRuntime.VerifyStable ignores it
+		},
+		zap.NewNop(),
+		runDeps{runtime: rt, control: ctrl, state: st},
+	)
+
+	if err == nil || !strings.Contains(err.Error(), "stability check") {
+		t.Fatalf("expected stability-check failure, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "never touched") {
+		t.Errorf("error should note the old backend was never touched, got: %v", err)
+	}
+
+	// New (bad) backend was registered, then deregistered during rollback —
+	// the old backend was NEVER drained or deregistered.
+	wantRegistered := []string{"api-newcontainer"}
+	if !reflect.DeepEqual(rt.removedIDs, []string{"newcontainer1234"}) {
+		t.Errorf("removedIDs = %v, want only the new (bad) container removed", rt.removedIDs)
+	}
+	if !reflect.DeepEqual(ctrl.registeredIDs, wantRegistered) {
+		t.Errorf("registeredIDs = %v, want %v", ctrl.registeredIDs, wantRegistered)
+	}
+	if !reflect.DeepEqual(ctrl.deregisteredIDs, wantRegistered) {
+		t.Errorf("deregisteredIDs = %v, want only the new backend deregistered, got %v", ctrl.deregisteredIDs, wantRegistered)
+	}
+	if len(ctrl.drainedIDs) != 0 {
+		t.Errorf("drainedIDs = %v, want none — the old backend must never be drained on this path", ctrl.drainedIDs)
+	}
+
+	// Scale up (+1) then back down to the original count — the bad container
+	// is fully unwound, same shape as the container-startup-failure case.
+	if len(rt.scaleCalls) != 2 || rt.scaleCalls[0] != 2 || rt.scaleCalls[1] != 1 {
+		t.Errorf("expected scale up then back down; scaleCalls=%v", rt.scaleCalls)
+	}
+
+	if !st.saved {
+		t.Error("rollback state should have been saved before the stability check ran")
+	}
+	if !st.cleared {
+		t.Error("rollback state should be cleared after a fully in-process auto-rollback — nothing left to manually roll back")
 	}
 }

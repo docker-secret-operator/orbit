@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -22,7 +23,9 @@ type fakeRuntime struct {
 	containerAddr    string
 	containerAddrErr error
 	removeErr        error
+	verifyStableErr  error
 	scaleCalls       []int
+	removedIDs       []string
 }
 
 func (f *fakeRuntime) Pull(context.Context, string, string) error { return f.pullErr }
@@ -42,21 +45,34 @@ func (f *fakeRuntime) FindOldContainer(context.Context, string, string) (string,
 func (f *fakeRuntime) ContainerAddr(context.Context, string) (string, error) {
 	return f.containerAddr, f.containerAddrErr
 }
-func (f *fakeRuntime) RemoveContainer(context.Context, string) error { return f.removeErr }
+func (f *fakeRuntime) RemoveContainer(_ context.Context, id string) error {
+	f.removedIDs = append(f.removedIDs, id)
+	return f.removeErr
+}
+func (f *fakeRuntime) VerifyStable(context.Context, string, time.Duration) error {
+	return f.verifyStableErr
+}
 
 type fakeControl struct {
 	registerErr   error
 	drainErr      error
 	deregisterErr error
+
+	registeredIDs   []string
+	drainedIDs      []string
+	deregisteredIDs []string
 }
 
-func (f *fakeControl) RegisterBackend(context.Context, Options, string, string, *zap.Logger) error {
+func (f *fakeControl) RegisterBackend(_ context.Context, _ Options, id, _ string, _ *zap.Logger) error {
+	f.registeredIDs = append(f.registeredIDs, id)
 	return f.registerErr
 }
-func (f *fakeControl) DrainBackend(context.Context, Options, string, *zap.Logger) error {
+func (f *fakeControl) DrainBackend(_ context.Context, _ Options, id string, _ *zap.Logger) error {
+	f.drainedIDs = append(f.drainedIDs, id)
 	return f.drainErr
 }
-func (f *fakeControl) DeregisterBackend(context.Context, Options, string, *zap.Logger) error {
+func (f *fakeControl) DeregisterBackend(_ context.Context, _ Options, id string, _ *zap.Logger) error {
+	f.deregisteredIDs = append(f.deregisteredIDs, id)
 	return f.deregisterErr
 }
 
