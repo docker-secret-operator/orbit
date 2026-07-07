@@ -121,6 +121,13 @@ func (oh *ObservabilityHooks) EmitEvent(event *MetricEvent) {
 	// Call hooks asynchronously
 	for name, hook := range hooks {
 		go func(hookName string, hookFunc ObservabilityHook) {
+			defer func() {
+				if r := recover(); r != nil {
+					oh.log.Error("hook panicked",
+						zap.String("hook", hookName),
+						zap.Any("panic", r))
+				}
+			}()
 			if err := hookFunc(event); err != nil {
 				oh.log.Warn("hook execution failed",
 					zap.String("hook", hookName),

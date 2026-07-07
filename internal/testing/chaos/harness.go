@@ -116,16 +116,34 @@ func (h *ChaosHarness) RunScenario(scenario *FailureScenario) *FailureResult {
 	return result
 }
 
-// validateInvariants checks system invariants after failure
+// validateInvariants checks system invariants after failure by loading
+// whatever active-generation/rollout state scenarios actually persisted to
+// disk and running them through state.InvariantValidator — the same
+// validator recovery uses in production. Every chaos scenario runs against
+// the fixed service name "web" (see scenarios.go). GenerationInventory is
+// omitted (nil) since these scenarios don't have a real Docker daemon to
+// discover live containers from, so orphan-generation checks are skipped;
+// revision monotonicity, authority uniqueness, and rollout consistency are
+// still checked against whatever was actually written to state files.
 func (h *ChaosHarness) validateInvariants() []string {
-	var violations []string
+	const service = "web"
 
-	// Check revision monotonicity
-	// Check authority uniqueness
-	// Check no orphan accumulation
-	// Future: integrate with invariants.go validators
+	activeGen, err := h.sm.LoadActiveGenerationState(service)
+	if err != nil {
+		return []string{fmt.Sprintf("active generation state unreadable: %v", err)}
+	}
 
-	return violations
+	rollout, err := h.sm.LoadRolloutState(service)
+	if err != nil {
+		return []string{fmt.Sprintf("rollout state unreadable: %v", err)}
+	}
+
+	validator := state.NewInvariantValidator(nil, activeGen, rollout)
+	if validator.ValidateAll() != nil {
+		return validator.Violations()
+	}
+
+	return nil
 }
 
 // recordResult safely records a scenario result

@@ -24,6 +24,46 @@ func TestAppendRequiresService(t *testing.T) {
 	}
 }
 
+func TestAppendRejectsPathTraversalServiceName(t *testing.T) {
+	stateDir := withStateDir(t)
+
+	err := Append(Event{Service: "../../../../etc/cron.d/evil", Type: EventRolloutStarted})
+	if err == nil {
+		t.Fatal("Append() with a path-traversal service name should error")
+	}
+
+	// Nothing should have been written outside the state dir at all.
+	if _, statErr := os.Stat(filepath.Join(stateDir, "etc")); statErr == nil {
+		t.Fatal("Append() must not write outside the history directory")
+	}
+}
+
+func TestAppendRejectsServiceNameWithSlash(t *testing.T) {
+	withStateDir(t)
+
+	err := Append(Event{Service: "foo/bar", Type: EventRolloutStarted})
+	if err == nil {
+		t.Fatal("Append() with a slash in the service name should error")
+	}
+}
+
+func TestReadRejectsPathTraversalServiceName(t *testing.T) {
+	withStateDir(t)
+
+	events, err := Read("../../../../etc/cron.d/evil", 0)
+	if err == nil {
+		t.Fatalf("Read() with a path-traversal service name should error, got events=%v", events)
+	}
+}
+
+func TestReadRejectsServiceNameWithSlash(t *testing.T) {
+	withStateDir(t)
+
+	if _, err := Read("foo/bar", 0); err == nil {
+		t.Fatal("Read() with a slash in the service name should error")
+	}
+}
+
 func TestAppendAndReadRoundTrip(t *testing.T) {
 	withStateDir(t)
 

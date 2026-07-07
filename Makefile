@@ -18,12 +18,15 @@ GOFLAGS    := -trimpath -ldflags="-s -w -X main.version=$(VERSION)"
 
 # Stable, deterministic packages — the blocking local/CI test gate.
 # Mirrors .github/workflows/ci.yml's "Test (stable)" step.
+# internal/stack and internal/state were excluded here as "known
+# flaky/failing" (see CHANGELOG.md); both are now -race-clean and promoted
+# back into the blocking gate.
 STABLE_PKGS := ./internal/api/... ./internal/cli/... ./internal/compose/... ./internal/config/... \
   ./internal/history/... ./internal/metrics/... ./internal/plugin/... ./internal/proxy/... \
-  ./internal/rollout/... ./internal/volumes/... \
+  ./internal/rollout/... ./internal/stack/... ./internal/state/... ./internal/volumes/... \
   ./internal/testing/concurrency/... ./internal/testing/profile/... ./cmd/...
 
-.PHONY: build test test-known-issues test-soak test-integration install-plugin lint docs docker-build docker-image docker-push dist dist-check install-local clean-dist clean help
+.PHONY: build test test-soak test-integration install-plugin lint docs docker-build docker-image docker-push dist dist-check install-local clean-dist clean help
 
 ## build: Compile the docker-orbit binary to ./bin/docker-orbit
 build:
@@ -34,10 +37,6 @@ build:
 ## test: Run the stable, deterministic test suite with the race detector (fast — mirrors CI's blocking gate)
 test:
 	$(GO) test -race -count=1 $(STABLE_PKGS)
-
-## test-known-issues: Run internal/stack and internal/state — known flaky/failing, non-blocking (see CHANGELOG.md)
-test-known-issues:
-	$(GO) test -race -count=1 ./internal/stack/... ./internal/state/... || true
 
 ## test-soak: Run chaos + extended-load suites (slow — minutes, not seconds; see .github/workflows/soak.yml)
 test-soak:

@@ -117,7 +117,9 @@ func (bra *BlastRadiusAnalyzer) analyzeBlastRadius(failedService string) BlastRa
 	result.AffectedServices = affected
 
 	// Check if blast radius exceeds policy thresholds
+	bra.rollout.mu.Lock()
 	totalServices := len(bra.rollout.state.ServiceStates)
+	bra.rollout.mu.Unlock()
 	failedCount := len(bra.failedServices)
 
 	// Calculate percentage
@@ -155,12 +157,16 @@ func (bra *BlastRadiusAnalyzer) analyzeBlastRadius(failedService string) BlastRa
 
 // getAllDependents recursively gets all services dependent on a service.
 func (bra *BlastRadiusAnalyzer) getAllDependents(service string, depth int) []string {
-	if depth <= 0 || bra.rollout.state.Graph == nil {
+	bra.rollout.mu.Lock()
+	graph := bra.rollout.state.Graph
+	bra.rollout.mu.Unlock()
+
+	if depth <= 0 || graph == nil {
 		return make([]string, 0)
 	}
 
 	affected := make(map[string]bool)
-	directDependents := bra.rollout.state.Graph.GetDependents(service)
+	directDependents := graph.GetDependents(service)
 
 	for _, dependent := range directDependents {
 		affected[dependent] = true
@@ -223,14 +229,21 @@ func (bra *BlastRadiusAnalyzer) quarantineServiceLocked(service string) error {
 
 // killService forcefully stops a service.
 func (bra *BlastRadiusAnalyzer) killService(service string) error {
+	bra.rollout.mu.Lock()
 	state, ok := bra.rollout.state.ServiceStates[service]
+	var containerID string
+	if ok {
+		containerID = state.NewContainer
+	}
+	bra.rollout.mu.Unlock()
+
 	if !ok {
 		return fmt.Errorf("service %q not found", service)
 	}
 
 	bra.log.Warn("killing service",
 		zap.String("service", service),
-		zap.String("container_id", state.NewContainer))
+		zap.String("container_id", containerID))
 
 	// In real implementation, would stop the container
 	// This would be done through DockerClient
@@ -240,18 +253,22 @@ func (bra *BlastRadiusAnalyzer) killService(service string) error {
 
 // rollbackService rolls back a failed service to previous version.
 func (bra *BlastRadiusAnalyzer) rollbackService(service string) error {
+	bra.rollout.mu.Lock()
 	state, ok := bra.rollout.state.ServiceStates[service]
 	if !ok {
+		bra.rollout.mu.Unlock()
 		return fmt.Errorf("service %q not found", service)
 	}
-
-	bra.log.Warn("rolling back service",
-		zap.String("service", service),
-		zap.String("old_container", state.OldContainer),
-		zap.String("new_container", state.NewContainer))
+	oldContainer, newContainer := state.OldContainer, state.NewContainer
 
 	// Swap containers: make old container active again
 	state.NewContainer, state.OldContainer = state.OldContainer, state.NewContainer
+	bra.rollout.mu.Unlock()
+
+	bra.log.Warn("rolling back service",
+		zap.String("service", service),
+		zap.String("old_container", oldContainer),
+		zap.String("new_container", newContainer))
 
 	return nil
 }

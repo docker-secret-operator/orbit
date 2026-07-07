@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 )
 
@@ -84,6 +85,30 @@ func Dir() string {
 	return filepath.Join(os.TempDir(), "orbit-history")
 }
 
+// validServiceName matches Compose-style service names: letters, digits,
+// dots, dashes, and underscores. No "/" or "\" means service can never
+// introduce a path segment, and no "." (checked separately for exactly "."
+// or "..") means it can never resolve to a directory traversal.
+var validServiceName = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// validateServiceName rejects any service name that isn't safe to
+// interpolate directly into a file path — in particular names containing
+// path separators or "." / ".." segments, which would otherwise let a
+// crafted compose service name read or write files outside the history
+// directory.
+func validateServiceName(service string) error {
+	if service == "" {
+		return fmt.Errorf("history: service name is required")
+	}
+	if service == "." || service == ".." {
+		return fmt.Errorf("history: invalid service name %q", service)
+	}
+	if !validServiceName.MatchString(service) {
+		return fmt.Errorf("history: invalid service name %q", service)
+	}
+	return nil
+}
+
 // path returns the JSONL file path for service's history.
 func path(service string) string {
 	return filepath.Join(Dir(), "history-"+service+".jsonl")
@@ -95,8 +120,8 @@ func path(service string) string {
 // Append is best-effort by design at call sites (a history-write failure
 // should never fail a rollout) but returns the error so callers can log it.
 func Append(ev Event) error {
-	if ev.Service == "" {
-		return fmt.Errorf("history: Append: Event.Service is required")
+	if err := validateServiceName(ev.Service); err != nil {
+		return err
 	}
 	if ev.Trigger == "" {
 		ev.Trigger = "cli"
@@ -131,6 +156,10 @@ func Append(ev Event) error {
 // error, if the log doesn't exist yet — an empty history is a normal state,
 // not a failure.
 func Read(service string, limit int) ([]Event, error) {
+	if err := validateServiceName(service); err != nil {
+		return nil, err
+	}
+
 	f, err := os.Open(path(service))
 	if os.IsNotExist(err) {
 		return []Event{}, nil

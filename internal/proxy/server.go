@@ -53,7 +53,13 @@ type Server struct {
 }
 
 // NewServer creates a proxy server backed by the given router and metrics.
+// m may be nil (defaults to a fresh no-op-equivalent sink): every connection
+// path calls s.metrics methods unconditionally, and *metrics.Proxy's methods
+// are not nil-receiver-safe.
 func NewServer(router *Router, log *zap.Logger, m *metrics.Proxy) *Server {
+	if m == nil {
+		m = metrics.New()
+	}
 	return &Server{
 		router:    router,
 		log:       log,

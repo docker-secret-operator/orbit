@@ -2,6 +2,30 @@ package rollout
 
 import "testing"
 
+// TestSelectOldContainer_ShortNewID_DoesNotPanic reproduces findOldContainer's
+// underlying bug: newID[:12] panics when newID is shorter than 12 characters
+// (e.g. a mocked/test runtime, or a future Docker output format change),
+// unlike shortID() which every other ID-shortening call site in this file
+// already uses safely.
+func TestSelectOldContainer_ShortNewID_DoesNotPanic(t *testing.T) {
+	shortNewID := "abc123" // 6 chars, shorter than the 12-char slice bound
+
+	old, err := selectOldContainer([]string{"def456789012", shortNewID}, shortNewID, "web")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if old != "def456789012" {
+		t.Fatalf("expected old container def456789012, got %q", old)
+	}
+}
+
+func TestSelectOldContainer_NoCandidatesQualify_ReturnsError(t *testing.T) {
+	_, err := selectOldContainer([]string{"newcontainer1"}, "newcontainer1", "web")
+	if err == nil {
+		t.Fatal("expected an error when every candidate matches newID")
+	}
+}
+
 // TestPlannedStepsCoversEveryReportedPhase guards the single-source-of-truth
 // property PlannedSteps exists for: every Phase Run can report through
 // Options.Progress (except PhaseComplete, which signals the end rather than

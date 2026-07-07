@@ -293,8 +293,12 @@ func (d *DockerSDKClient) PullImage(imageName string) error {
 	}
 	defer reader.Close()
 
-	// Consume the pull output to avoid resource leak
-	io.Copy(io.Discard, reader)
+	// Consume the pull output to avoid resource leak. A failure here means
+	// the pull stream was truncated/interrupted — the image may be
+	// incomplete or stale, so surface it rather than reporting success.
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		return fmt.Errorf("read image pull stream: %w", err)
+	}
 
 	d.log.Info("image pulled",
 		zap.String("image", imageName))
@@ -401,7 +405,7 @@ func portMapToPortBindings(ports map[int]int) nat.PortMap {
 		return nat.PortMap{}
 	}
 	bindings := nat.PortMap{}
-	for containerPort, hostPort := range ports {
+	for hostPort, containerPort := range ports {
 		containerPortNat := nat.Port(fmt.Sprintf("%d/tcp", containerPort))
 		bindings[containerPortNat] = []nat.PortBinding{
 			{

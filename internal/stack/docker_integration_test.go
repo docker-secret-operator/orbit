@@ -1,11 +1,48 @@
 package stack
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
+
+func TestEnsureServiceRunning_StartFails_LogsCleanupFailure(t *testing.T) {
+	core, observed := observer.New(zapcore.WarnLevel)
+	logger := zap.New(core)
+
+	config := &StackRolloutConfig{}
+	sr := NewStackRollout(config, logger)
+	mockClient := NewMockDockerClient(logger)
+	di := NewDockerIntegration(sr, mockClient, logger)
+
+	sr.state.ServiceStates["api"] = &ServiceRolloutState{
+		Service: "api",
+		Status:  StatusPending,
+	}
+
+	mockClient.StartContainerError = errors.New("start failed")
+	mockClient.RemoveContainerError = errors.New("remove failed")
+
+	err := di.ensureServiceRunning("api")
+	if err == nil {
+		t.Fatal("expected error from failed start")
+	}
+
+	found := false
+	for _, entry := range observed.All() {
+		if strings.Contains(strings.ToLower(entry.Message), "cleanup") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a warning log about the failed container cleanup, got entries: %+v", observed.All())
+	}
+}
 
 func TestEnsureContainersRunning(t *testing.T) {
 	logger, _ := zap.NewProduction()
@@ -337,6 +374,58 @@ func TestDockerClientNotFound(t *testing.T) {
 	// Try to monitor health on non-existent container
 	if err := di.MonitorContainerHealth("api", 1*time.Second); err == nil {
 		t.Fatal("expected error for missing container")
+	}
+}
+
+func TestRolloutService_RemovesActualOldContainerNotNewOne(t *testing.T) {
+	logger, _ := zap.NewProduction()
+	defer logger.Sync()
+
+	config := &StackRolloutConfig{}
+	sr := NewStackRollout(config, logger)
+	mockClient := NewMockDockerClient(logger)
+	di := NewDockerIntegration(sr, mockClient, logger)
+
+	oldContainer := "old-api-container"
+	mockClient.CreatedContainers[oldContainer] = &ContainerInfo{
+		ID:     oldContainer,
+		Status: ContainerRunning,
+	}
+
+	newContainer := "mock-api"
+	mockClient.CreatedContainers[newContainer] = &ContainerInfo{
+		ID:     newContainer,
+		Status: ContainerRunning,
+	}
+	mockClient.ContainerStates[newContainer] = ContainerRunning
+	mockClient.ContainerHealthStates[newContainer] = HealthHealthy
+
+	sr.state.ServiceStates["api"] = &ServiceRolloutState{
+		Service:      "api",
+		Status:       StatusPending,
+		OldContainer: oldContainer,
+		NewContainer: newContainer,
+		CircuitBreaker: &CircuitBreakerState{
+			State: CircuitClosed,
+		},
+	}
+
+	if err := di.RolloutService("api", 5*time.Second); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	state := sr.state.ServiceStates["api"]
+
+	if state.NewContainer != newContainer {
+		t.Fatalf("expected new container to remain active, got %q", state.NewContainer)
+	}
+
+	if _, ok := mockClient.CreatedContainers[newContainer]; !ok {
+		t.Fatal("newly deployed container was removed by cleanup; it should still be running")
+	}
+
+	if _, ok := mockClient.CreatedContainers[oldContainer]; ok {
+		t.Fatal("previous container was leaked; it should have been removed by cleanup")
 	}
 }
 

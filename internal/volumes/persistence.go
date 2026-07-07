@@ -125,6 +125,26 @@ func PersistSnapshots(snapshots map[string]*VolumeSnapshot) map[string]interface
 	return result
 }
 
+// groupVolumesByOwner buckets snapshot-derived VolumeInfo by owner container,
+// so a multi-container service restores each container's own volumes instead
+// of applying one container's volumes to all owners.
+func groupVolumesByOwner(snapshots map[string]*VolumeSnapshot) map[string][]VolumeInfo {
+	groups := make(map[string][]VolumeInfo)
+	for _, snapshot := range snapshots {
+		if snapshot.OwnerContainer == "" {
+			continue
+		}
+		vol := VolumeInfo{
+			Name:       snapshot.Name,
+			MountPath:  snapshot.MountPath,
+			ReadOnly:   snapshot.Mode == "ro",
+			Containers: []string{snapshot.OwnerContainer},
+		}
+		groups[snapshot.OwnerContainer] = append(groups[snapshot.OwnerContainer], vol)
+	}
+	return groups
+}
+
 // RestoreFromSnapshots recovers volume state from persisted snapshots.
 // Called during rollback to restore volumes to their pre-rollout state.
 func (vm *VolumeManager) RestoreFromSnapshots(ctx context.Context, snapshots map[string]*VolumeSnapshot) error {
@@ -135,36 +155,14 @@ func (vm *VolumeManager) RestoreFromSnapshots(ctx context.Context, snapshots map
 		return nil
 	}
 
-	// Build list of VolumeInfo from snapshots for restoration
-	volumes := make([]VolumeInfo, 0, len(snapshots))
-	for _, snapshot := range snapshots {
-		vol := VolumeInfo{
-			Name:      snapshot.Name,
-			MountPath: snapshot.MountPath,
-			ReadOnly:  snapshot.Mode == "ro",
-		}
-		if snapshot.OwnerContainer != "" {
-			vol.Containers = []string{snapshot.OwnerContainer}
-		}
-		volumes = append(volumes, vol)
-	}
-
-	// If we have an owner container, restore its volume state
-	if len(volumes) > 0 && len(snapshots) > 0 {
-		// Get first snapshot's owner (all should have same owner in a single rollout)
-		firstSnapshot := snapshots[""]
-		for _, v := range snapshots {
-			firstSnapshot = v
-			break
-		}
-
-		if firstSnapshot != nil && firstSnapshot.OwnerContainer != "" {
-			if err := vm.RestoreVolumeState(ctx, firstSnapshot.OwnerContainer, volumes); err != nil {
-				vm.log.Warn("failed to restore volume state",
-					zap.String("container", firstSnapshot.OwnerContainer),
-					zap.Error(err))
-				// Don't fail the entire restore if one container has issues
-			}
+	// Restore each owner container's own volumes independently, since a
+	// service can have multiple containers each owning distinct volumes.
+	for owner, volumes := range groupVolumesByOwner(snapshots) {
+		if err := vm.RestoreVolumeState(ctx, owner, volumes); err != nil {
+			vm.log.Warn("failed to restore volume state",
+				zap.String("container", owner),
+				zap.Error(err))
+			// Don't fail the entire restore if one container has issues
 		}
 	}
 

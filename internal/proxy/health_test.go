@@ -138,6 +138,40 @@ func TestContextCancellationHandling(t *testing.T) {
 	}
 }
 
+// TestHealthValidator_CloseDoesNotPanicWithInFlightCheck reproduces the
+// production shutdown shape (deployer.Close calls healthValidator.Close()
+// right before docker client.Close()): a CheckHealth call still blocked
+// trying to acquire the semaphore when Close() runs must not panic with
+// "send on closed channel".
+func TestHealthValidator_CloseDoesNotPanicWithInFlightCheck(t *testing.T) {
+	log := zap.NewNop()
+	defer log.Sync()
+
+	hv := NewHealthValidator(nil, log, 2*time.Second, 1)
+
+	// Fill the only semaphore slot so the CheckHealth call below blocks in
+	// the acquire select instead of proceeding immediately.
+	hv.semaphore <- struct{}{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		hv.CheckHealth(ctx, "container-1", Backend{ID: "b1", Addr: "127.0.0.1:1"})
+	}()
+
+	// Give the goroutine time to reach the blocked acquire before closing.
+	time.Sleep(5 * time.Millisecond)
+
+	if err := hv.Close(); err != nil {
+		t.Fatalf("unexpected error from Close: %v", err)
+	}
+
+	<-done
+}
+
 func TestBatchCheckEmptyInput(t *testing.T) {
 	log := zap.NewNop()
 	defer log.Sync()

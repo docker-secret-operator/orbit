@@ -25,9 +25,10 @@ jobs:
         run: go build ./...
 
       # Deterministic packages only. Blocking gate — must stay green.
-      # Excludes internal/stack, internal/state (see "Known issues" step
-      # below) and internal/testing/chaos, internal/testing/benchmark
+      # Excludes internal/testing/chaos, internal/testing/benchmark
       # (soak/long-running suites — see .github/workflows/soak.yml).
+      # internal/stack and internal/state were excluded here as "known
+      # flaky/failing"; both are now -race-clean and included.
       - name: Test (stable)
         run: |
           go test -race -count=1 \
@@ -40,19 +41,12 @@ jobs:
             ./internal/plugin/... \
             ./internal/proxy/... \
             ./internal/rollout/... \
+            ./internal/stack/... \
+            ./internal/state/... \
             ./internal/volumes/... \
             ./internal/testing/concurrency/... \
             ./internal/testing/profile/... \
             ./cmd/...
-
-      # internal/stack: known data races in MockDockerClient / transaction
-      # test harness (tech debt, tracked — not product-code races).
-      # internal/state: TestIsTransitionStaleWithProgress is a known,
-      # deterministic recovery-algorithm bug (tech debt, tracked).
-      # Both run so failures stay visible; neither blocks merge until fixed.
-      - name: Test (known issues - non-blocking)
-        continue-on-error: true
-        run: go test -race -count=1 ./internal/stack/... ./internal/state/...
 
       - name: Vet
         run: go vet ./...

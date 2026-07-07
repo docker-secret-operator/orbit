@@ -48,3 +48,11 @@ Desktop.ini
 # Dependency cache (shouldn't be here but just in case)
 vendor/
 /dist/
+
+# Stray JS/Node tooling artifacts — this is a Go project; no package.json or
+# next.config.js exists at the root. If these reappear, something outside
+# this project (a misconfigured tool, wrong cwd) is generating them.
+node_modules/
+.next/
+next-env.d.ts
+tsconfig.tsbuildinfo

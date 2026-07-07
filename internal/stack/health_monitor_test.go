@@ -175,6 +175,66 @@ done:
 	}
 }
 
+// TestConcurrentHealthMonitoringAndForegroundRolloutAccess reproduces the
+// real production shape: HealthMonitor.monitorServiceHealth runs as its own
+// background goroutine mutating rollout.state.ServiceStates via
+// emitHealthEvent -> updateRolloutStateFromEvent, while the goroutine driving
+// the rollout concurrently calls UpdateServiceStatus/MarkServiceHealthy/
+// CanProceedWithRollout/GetMetrics on the same StackRollout. Run with -race
+// to catch the unsynchronized map/field access.
+func TestConcurrentHealthMonitoringAndForegroundRolloutAccess(t *testing.T) {
+	log := zap.NewNop()
+	config := &StackRolloutConfig{}
+	rollout := NewStackRollout(config, log)
+	rollout.state.ServiceStates["service1"] = &ServiceRolloutState{
+		NewContainer: "container123",
+		Status:       StatusPending,
+		CircuitBreaker: &CircuitBreakerState{
+			State: CircuitClosed,
+		},
+	}
+
+	mockClient := NewMockDockerClient(log)
+	mockClient.ContainerHealthStates["container123"] = HealthHealthy
+
+	hm := NewHealthMonitor(rollout, mockClient, log)
+	hm.config.CheckInterval = 1 * time.Millisecond
+
+	if err := hm.StartMonitoring("service1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer hm.StopMonitoring("service1")
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	foreground := func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			rollout.UpdateServiceStatus("service1", StatusHealthCheck, nil)
+			rollout.MarkServiceHealthy("service1")
+			rollout.CanProceedWithRollout(0)
+			rollout.GetMetrics()
+		}
+	}
+
+	wg.Add(2)
+	go foreground()
+	go foreground()
+
+	// The initial Unknown -> Healthy transition alone is enough to make
+	// emitHealthEvent fire and mutate rollout.state.ServiceStates once from
+	// the background goroutine, overlapping with the foreground writes.
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
 func TestGetLastEvent(t *testing.T) {
 	log := zap.NewNop()
 	config := &StackRolloutConfig{}
@@ -376,4 +436,31 @@ func TestHealthEventListenerNonBlocking(t *testing.T) {
 	}
 
 	close(blockingChan)
+}
+
+// TestEmitHealthEvent_ListenerPanicDoesNotCrashProcess guards
+// emitHealthEvent's per-listener goroutine: a panicking listener must not
+// take down the whole process, and well-behaved listeners registered
+// alongside it must still run.
+func TestEmitHealthEvent_ListenerPanicDoesNotCrashProcess(t *testing.T) {
+	log := zap.NewNop()
+	config := &StackRolloutConfig{}
+	rollout := NewStackRollout(config, log)
+	hm := NewHealthMonitor(rollout, NewMockDockerClient(log), log)
+
+	goodListenerCalled := make(chan struct{}, 1)
+	hm.RegisterListener(func(event *HealthEvent) {
+		panic("boom")
+	})
+	hm.RegisterListener(func(event *HealthEvent) {
+		goodListenerCalled <- struct{}{}
+	})
+
+	hm.emitHealthEvent("service1", HealthUnknown, HealthHealthy)
+
+	select {
+	case <-goodListenerCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("well-behaved listener was not called (panicking listener may have crashed the process/goroutine group)")
+	}
 }

@@ -27,7 +27,7 @@ func AcquireAdvisoryLock(lockPath string, timeout time.Duration) (*AdvisoryLock,
 	// Create/open lock file
 	f, err := os.OpenFile(lockPath,
 		os.O_CREATE|os.O_WRONLY,
-		0644)
+		0600)
 	if err != nil {
 		return nil, fmt.Errorf("open lock file: %w", err)
 	}
@@ -70,7 +70,7 @@ func AcquireAdvisoryLock(lockPath string, timeout time.Duration) (*AdvisoryLock,
 func AcquireAdvisoryReadLock(lockPath string, timeout time.Duration) (*AdvisoryLock, error) {
 	f, err := os.OpenFile(lockPath,
 		os.O_CREATE|os.O_RDONLY,
-		0644)
+		0600)
 	if err != nil {
 		return nil, fmt.Errorf("open lock file: %w", err)
 	}
@@ -417,6 +417,8 @@ func (sm *StateManager) LoadRolloutState(service string) (*RolloutState, error) 
 }
 
 // WriteRolloutState writes rollout state with locking.
+// Uses CAS (Compare-And-Swap) semantics via revision numbers, mirroring
+// WriteActiveGenerationState.
 func (sm *StateManager) WriteRolloutState(state *RolloutState, log interface{}) error {
 	lockPath := sm.StateLockPath(state.Service)
 
@@ -430,8 +432,49 @@ func (sm *StateManager) WriteRolloutState(state *RolloutState, log interface{}) 
 	inProcessLock.Lock()
 	defer inProcessLock.Unlock()
 
+	// CAS: Verify revision matches expected
+	current, err := sm.loadCurrentRolloutStateUnsafe(state.Service)
+	if err == nil && current != nil {
+		if state.PreviousRevision != current.Revision {
+			return fmt.Errorf("revision conflict: expected %d, found %d (write skipped)",
+				state.PreviousRevision, current.Revision)
+		}
+	}
+
+	// Safe to write: bump revision. UnixNano (not Unix) — rollouts can
+	// legitimately write successive states within the same second (e.g.
+	// draining -> committing back-to-back), and a 1-second-resolution
+	// counter would let two writes in the same second collide on the same
+	// revision, silently defeating the CAS check that depends on it.
+	state.Revision = time.Now().UnixNano()
+	if current != nil {
+		state.PreviousRevision = current.Revision
+	}
+
 	stateFile := sm.rolloutStatePath(state.Service)
 	return AtomicWriteJSON(stateFile, state, log)
+}
+
+// loadCurrentRolloutStateUnsafe loads rollout state without locking — callers
+// must already hold the appropriate lock (mirrors
+// loadCurrentActiveGenerationUnsafe).
+func (sm *StateManager) loadCurrentRolloutStateUnsafe(service string) (*RolloutState, error) {
+	stateFile := sm.rolloutStatePath(service)
+	bytes, err := LoadStateFile(stateFile)
+	if err != nil {
+		return nil, err
+	}
+
+	if bytes == nil {
+		return nil, nil
+	}
+
+	var rs RolloutState
+	if err := json.Unmarshal(bytes, &rs); err != nil {
+		return nil, err
+	}
+
+	return &rs, nil
 }
 
 // DeleteRolloutState deletes rollout state (on completion).

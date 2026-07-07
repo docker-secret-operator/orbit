@@ -2,10 +2,13 @@ package stack
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -109,8 +112,8 @@ func (sp *StatePersistence) LogOperation(operation, service string, data interfa
 		Operation: operation,
 		Service:   service,
 		Data:      data,
-		Checksum:  sp.calculateChecksum(operation + service),
 	}
+	entry.Checksum = sp.calculateChecksum(entry)
 
 	sp.walEntries = append(sp.walEntries, entry)
 
@@ -147,22 +150,29 @@ func (sp *StatePersistence) writeWALEntry(entry WALEntry) error {
 		return fmt.Errorf("failed to write WAL entry: %w", err)
 	}
 
-	sp.walFile.Sync()
+	if err := sp.walFile.Sync(); err != nil {
+		return fmt.Errorf("failed to fsync WAL entry: %w", err)
+	}
 	return nil
 }
 
 // SaveState saves the current rollout state to disk.
 func (sp *StatePersistence) SaveState(rollout *StackRollout, txnState TransactionState) error {
+	rollout.mu.Lock()
 	if len(rollout.state.ServiceStates) == 0 {
+		rollout.mu.Unlock()
 		return fmt.Errorf("no service states to save")
 	}
 
-	// Get first service name from states
-	service := ""
+	// Pick the lexicographically-first service name so repeated saves of the
+	// same state are deterministic — Go map iteration order is randomized,
+	// so "first" via a bare range would otherwise vary from run to run.
+	names := make([]string, 0, len(rollout.state.ServiceStates))
 	for name := range rollout.state.ServiceStates {
-		service = name
-		break
+		names = append(names, name)
 	}
+	sort.Strings(names)
+	service := names[0]
 
 	persistent := &PersistentState{
 		Version:          1,
@@ -175,13 +185,17 @@ func (sp *StatePersistence) SaveState(rollout *StackRollout, txnState Transactio
 		LastCheckpoint:   time.Now(),
 	}
 
-	// Write to state file
-	stateFile := filepath.Join(sp.stateDir, fmt.Sprintf("state-%s.json", service))
-
+	// Marshal while still holding the lock: persistent.ServiceStates aliases
+	// the live map, and json.Marshal ranges over it plus reads each
+	// *ServiceRolloutState's fields.
 	data, err := json.MarshalIndent(persistent, "", "  ")
+	rollout.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to marshal state: %w", err)
 	}
+
+	// Write to state file
+	stateFile := filepath.Join(sp.stateDir, fmt.Sprintf("state-%s.json", service))
 
 	if err := os.WriteFile(stateFile, data, 0640); err != nil {
 		return fmt.Errorf("failed to write state file: %w", err)
@@ -248,9 +262,11 @@ func (sp *StatePersistence) RecoverFromCrash(service string, rollout *StackRollo
 	}
 
 	// Restore service states
+	rollout.mu.Lock()
 	for svcName, state := range persistent.ServiceStates {
 		rollout.state.ServiceStates[svcName] = state
 	}
+	rollout.mu.Unlock()
 
 	return persistent, nil
 }
@@ -281,6 +297,13 @@ func (sp *StatePersistence) ReadWAL() ([]WALEntry, error) {
 		if err := json.Unmarshal(line, &entry); err != nil {
 			sp.log.Warn("failed to parse WAL entry",
 				zap.Error(err))
+			continue
+		}
+
+		if expected := sp.calculateChecksum(entry); expected != entry.Checksum {
+			sp.log.Warn("WAL entry failed checksum verification, discarding",
+				zap.String("operation", entry.Operation),
+				zap.String("service", entry.Service))
 			continue
 		}
 
@@ -334,7 +357,19 @@ func (sp *StatePersistence) Close() error {
 	return nil
 }
 
-// Helper function
-func (sp *StatePersistence) calculateChecksum(data string) string {
-	return fmt.Sprintf("%x", len(data))
+// calculateChecksum computes a checksum over an entry's meaningful content
+// (everything except the Checksum field itself), so tampering with any of
+// Timestamp/Operation/Service/Data is detectable on read.
+func (sp *StatePersistence) calculateChecksum(entry WALEntry) string {
+	payload, err := json.Marshal(struct {
+		Timestamp time.Time   `json:"timestamp"`
+		Operation string      `json:"operation"`
+		Service   string      `json:"service"`
+		Data      interface{} `json:"data"`
+	}{entry.Timestamp, entry.Operation, entry.Service, entry.Data})
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
 }

@@ -82,6 +82,13 @@ type RolloutState struct {
 	DrainStartedAt     time.Time              `json:"drain_started_at"`  // When drain phase began (for progress detection)
 	LastProgressAt     time.Time              `json:"last_progress_at"`  // When last progress detected (resets timeout clock)
 	VolumeSnapshots    map[string]interface{} `json:"volumes,omitempty"` // Volume state snapshots for recovery/rollback
+
+	// Revision/PreviousRevision give WriteRolloutState the same CAS
+	// (Compare-And-Swap) protection as WriteActiveGenerationState: a caller
+	// must set PreviousRevision to the Revision it last read, or the write
+	// is rejected as a stale write over a concurrent modification.
+	Revision         int64 `json:"revision"`
+	PreviousRevision int64 `json:"previous_revision"`
 }
 
 // ============================================================================

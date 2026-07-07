@@ -2,6 +2,7 @@ package stack
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -177,8 +178,15 @@ func (dc *RealDockerClient) WaitForContainer(containerID string, timeout time.Du
 }
 
 // MockDockerClient is a test double for Docker operations.
+//
+// mu guards CreatedContainers/ContainerStates/ContainerHealthStates: tests
+// that simulate a container becoming healthy from a background goroutine
+// (while the main goroutine drives a transaction/rollout that reads the same
+// maps) must go through SetContainerHealth rather than writing the map
+// field directly, or the access races.
 type MockDockerClient struct {
 	log                     *zap.Logger
+	mu                      sync.Mutex
 	CreatedContainers       map[string]*ContainerInfo
 	ContainerStates         map[string]ContainerStatus
 	ContainerHealthStates   map[string]HealthStatus
@@ -202,6 +210,8 @@ func NewMockDockerClient(log *zap.Logger) *MockDockerClient {
 
 // CreateContainer mocks container creation.
 func (m *MockDockerClient) CreateContainer(opts *RunOptions) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.CreateContainerError != nil {
 		return "", m.CreateContainerError
 	}
@@ -220,6 +230,8 @@ func (m *MockDockerClient) CreateContainer(opts *RunOptions) (string, error) {
 
 // StartContainer mocks starting a container.
 func (m *MockDockerClient) StartContainer(containerID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.StartContainerError != nil {
 		return m.StartContainerError
 	}
@@ -229,6 +241,8 @@ func (m *MockDockerClient) StartContainer(containerID string) error {
 
 // StopContainer mocks stopping a container.
 func (m *MockDockerClient) StopContainer(containerID string, timeout time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.StopContainerError != nil {
 		return m.StopContainerError
 	}
@@ -238,6 +252,8 @@ func (m *MockDockerClient) StopContainer(containerID string, timeout time.Durati
 
 // RemoveContainer mocks removing a container.
 func (m *MockDockerClient) RemoveContainer(containerID string, force bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.RemoveContainerError != nil {
 		return m.RemoveContainerError
 	}
@@ -248,6 +264,8 @@ func (m *MockDockerClient) RemoveContainer(containerID string, force bool) error
 
 // InspectContainer mocks inspection.
 func (m *MockDockerClient) InspectContainer(containerID string) (*ContainerInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.InspectContainerError != nil {
 		return nil, m.InspectContainerError
 	}
@@ -260,6 +278,8 @@ func (m *MockDockerClient) InspectContainer(containerID string) (*ContainerInfo,
 
 // ListContainers mocks listing containers.
 func (m *MockDockerClient) ListContainers(filters map[string][]string) ([]*ContainerInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	result := make([]*ContainerInfo, 0, len(m.CreatedContainers))
 	for _, info := range m.CreatedContainers {
 		result = append(result, info)
@@ -269,6 +289,8 @@ func (m *MockDockerClient) ListContainers(filters map[string][]string) ([]*Conta
 
 // GetContainerHealth mocks getting health status.
 func (m *MockDockerClient) GetContainerHealth(containerID string) (HealthStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.GetContainerHealthError != nil {
 		return HealthUnknown, m.GetContainerHealthError
 	}
@@ -277,6 +299,17 @@ func (m *MockDockerClient) GetContainerHealth(containerID string) (HealthStatus,
 		return HealthUnknown, nil
 	}
 	return status, nil
+}
+
+// SetContainerHealth safely sets a container's mocked health status. Tests
+// that flip a container's health from a background goroutine (to unblock a
+// health-check loop running on another goroutine) must use this instead of
+// writing ContainerHealthStates directly, since CreateContainer/
+// GetContainerHealth also access it under mu.
+func (m *MockDockerClient) SetContainerHealth(containerID string, health HealthStatus) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ContainerHealthStates[containerID] = health
 }
 
 // PullImage mocks pulling an image.

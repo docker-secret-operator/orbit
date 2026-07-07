@@ -3,6 +3,8 @@ package volumes
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +40,34 @@ func (m *MockDockerClient) VolumeInspect(ctx context.Context, name string) (volu
 		return volume.Volume{}, fmt.Errorf("VolumeInspect not mocked")
 	}
 	return m.VolumeInspectFn(ctx, name)
+}
+
+// fakeCommandRunner records invocations and returns configured results instead
+// of touching the real Docker daemon.
+type fakeCommandRunner struct {
+	calls   [][]string
+	err     error
+	errFor  map[string]error // keyed by strings.Join(args, " ")
+	stdout  []byte           // written to the caller's stdout writer, if any
+}
+
+func (f *fakeCommandRunner) Run(ctx context.Context, stdout io.Writer, name string, args ...string) error {
+	call := append([]string{name}, args...)
+	f.calls = append(f.calls, call)
+
+	if f.errFor != nil {
+		if err, ok := f.errFor[strings.Join(args, " ")]; ok && err != nil {
+			return err
+		}
+	}
+
+	if stdout != nil && f.stdout != nil {
+		if _, err := stdout.Write(f.stdout); err != nil {
+			return err
+		}
+	}
+
+	return f.err
 }
 
 func TestNewVolumeManager(t *testing.T) {
@@ -587,6 +617,8 @@ func TestPreventConcurrentAccess_WasReadWrite(t *testing.T) {
 		},
 	}
 	vm := NewVolumeManager(mock, logger)
+	fake := &fakeCommandRunner{}
+	vm.runner = fake
 	ctx := context.Background()
 
 	wasRW, err := vm.PreventConcurrentAccess(ctx, "container-1", "/data")
@@ -596,28 +628,92 @@ func TestPreventConcurrentAccess_WasReadWrite(t *testing.T) {
 	if !wasRW {
 		t.Fatal("expected wasRW=true for read-write volume")
 	}
+
+	if len(fake.calls) != 1 {
+		t.Fatalf("expected exactly one remount command, got %d: %v", len(fake.calls), fake.calls)
+	}
+	got := fake.calls[0]
+	want := []string{"docker", "exec", "container-1", "mount", "-o", "remount,ro", "/data"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("unexpected remount command: got %v, want %v", got, want)
+	}
 }
 
-func TestTemporarySnapshot_CreatesPath(t *testing.T) {
+func TestPreventConcurrentAccess_RemountFails_ReturnsError(t *testing.T) {
+	logger, _ := zap.NewProduction()
+	defer logger.Sync()
+
+	mock := &MockDockerClient{
+		ContainerInspectFn: func(ctx context.Context, containerID string) (types.ContainerJSON, error) {
+			return types.ContainerJSON{
+				ContainerJSONBase: &types.ContainerJSONBase{ID: "container-1"},
+				Mounts: []types.MountPoint{
+					{Name: "data", Destination: "/data", RW: true},
+				},
+			}, nil
+		},
+	}
+	vm := NewVolumeManager(mock, logger)
+	vm.runner = &fakeCommandRunner{err: fmt.Errorf("container has no CAP_SYS_ADMIN")}
+	ctx := context.Background()
+
+	_, err := vm.PreventConcurrentAccess(ctx, "container-1", "/data")
+	if err == nil {
+		t.Fatal("expected error to propagate when remount fails, got nil")
+	}
+}
+
+func TestTemporarySnapshot_WritesRealFileFromRunnerOutput(t *testing.T) {
 	logger, _ := zap.NewProduction()
 	defer logger.Sync()
 
 	mock := &MockDockerClient{}
 	vm := NewVolumeManager(mock, logger)
+	fake := &fakeCommandRunner{stdout: []byte("fake-tarball-bytes")}
+	vm.runner = fake
 	ctx := context.Background()
 
 	snapshotPath, err := vm.TemporarySnapshot(ctx, "db_data")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	defer os.Remove(snapshotPath)
+
 	if snapshotPath == "" {
 		t.Fatal("expected non-empty snapshot path")
 	}
 	if !strings.Contains(snapshotPath, "db_data") {
 		t.Fatalf("expected snapshot path to contain volume name, got %s", snapshotPath)
 	}
-	if !strings.Contains(snapshotPath, "tmp") {
-		t.Fatalf("expected snapshot path to be in /tmp, got %s", snapshotPath)
+
+	contents, err := os.ReadFile(snapshotPath)
+	if err != nil {
+		t.Fatalf("expected snapshot file to exist on disk: %v", err)
+	}
+	if string(contents) != "fake-tarball-bytes" {
+		t.Fatalf("expected snapshot file to contain runner output, got %q", string(contents))
+	}
+
+	if len(fake.calls) != 1 || fake.calls[0][0] != "docker" || fake.calls[0][1] != "run" {
+		t.Fatalf("expected a 'docker run' snapshot command, got %v", fake.calls)
+	}
+}
+
+func TestTemporarySnapshot_RunnerFails_ReturnsErrorAndNoFile(t *testing.T) {
+	logger, _ := zap.NewProduction()
+	defer logger.Sync()
+
+	mock := &MockDockerClient{}
+	vm := NewVolumeManager(mock, logger)
+	vm.runner = &fakeCommandRunner{err: fmt.Errorf("docker daemon unreachable")}
+	ctx := context.Background()
+
+	snapshotPath, err := vm.TemporarySnapshot(ctx, "db_data")
+	if err == nil {
+		t.Fatal("expected error when snapshot command fails, got nil")
+	}
+	if snapshotPath != "" {
+		t.Fatalf("expected empty snapshot path on failure, got %q", snapshotPath)
 	}
 }
 
@@ -669,6 +765,8 @@ func TestRestoreVolumeState_SingleVolume(t *testing.T) {
 
 	mock := &MockDockerClient{}
 	vm := NewVolumeManager(mock, logger)
+	fake := &fakeCommandRunner{}
+	vm.runner = fake
 	ctx := context.Background()
 
 	volumes := []VolumeInfo{
@@ -683,6 +781,14 @@ func TestRestoreVolumeState_SingleVolume(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
+	if len(fake.calls) != 1 {
+		t.Fatalf("expected exactly one remount command, got %d: %v", len(fake.calls), fake.calls)
+	}
+	want := []string{"docker", "exec", "container-1", "mount", "-o", "remount,rw", "/var/lib/postgresql/data"}
+	if strings.Join(fake.calls[0], " ") != strings.Join(want, " ") {
+		t.Fatalf("unexpected remount command: got %v, want %v", fake.calls[0], want)
+	}
 }
 
 func TestRestoreVolumeState_MultipleVolumes(t *testing.T) {
@@ -691,6 +797,8 @@ func TestRestoreVolumeState_MultipleVolumes(t *testing.T) {
 
 	mock := &MockDockerClient{}
 	vm := NewVolumeManager(mock, logger)
+	fake := &fakeCommandRunner{}
+	vm.runner = fake
 	ctx := context.Background()
 
 	volumes := []VolumeInfo{
@@ -709,6 +817,40 @@ func TestRestoreVolumeState_MultipleVolumes(t *testing.T) {
 	err := vm.RestoreVolumeState(ctx, "container-1", volumes)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(fake.calls) != 2 {
+		t.Fatalf("expected a remount command per volume, got %d: %v", len(fake.calls), fake.calls)
+	}
+}
+
+func TestRestoreVolumeState_PropagatesRemountErrors(t *testing.T) {
+	logger, _ := zap.NewProduction()
+	defer logger.Sync()
+
+	mock := &MockDockerClient{}
+	vm := NewVolumeManager(mock, logger)
+	fake := &fakeCommandRunner{
+		errFor: map[string]error{
+			"exec container-1 mount -o remount,rw /var/lib/postgresql/data": fmt.Errorf("mount busy"),
+		},
+	}
+	vm.runner = fake
+	ctx := context.Background()
+
+	volumes := []VolumeInfo{
+		{Name: "db_data", MountPath: "/var/lib/postgresql/data", ReadOnly: false},
+		{Name: "db_logs", MountPath: "/var/log/postgresql", ReadOnly: false},
+	}
+
+	err := vm.RestoreVolumeState(ctx, "container-1", volumes)
+	if err == nil {
+		t.Fatal("expected error when a volume fails to restore, got nil")
+	}
+
+	// Both volumes should still have been attempted despite the first failing.
+	if len(fake.calls) != 2 {
+		t.Fatalf("expected both volumes to be attempted, got %d calls: %v", len(fake.calls), fake.calls)
 	}
 }
 
@@ -1101,6 +1243,39 @@ func TestRestoreFromSnapshots(t *testing.T) {
 	err := vm.RestoreFromSnapshots(ctx, snapshots)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRestoreFromSnapshots_MultipleOwnerContainers(t *testing.T) {
+	snapshots := map[string]*VolumeSnapshot{
+		"/data/db": {
+			Name:           "db_data",
+			MountPath:      "/data/db",
+			Mode:           "rw",
+			OwnerContainer: "container-a",
+		},
+		"/data/cache": {
+			Name:           "cache_data",
+			MountPath:      "/data/cache",
+			Mode:           "rw",
+			OwnerContainer: "container-b",
+		},
+	}
+
+	groups := groupVolumesByOwner(snapshots)
+
+	if len(groups) != 2 {
+		t.Fatalf("expected 2 owner containers, got %d: %+v", len(groups), groups)
+	}
+
+	aVolumes, ok := groups["container-a"]
+	if !ok || len(aVolumes) != 1 || aVolumes[0].Name != "db_data" {
+		t.Fatalf("expected container-a to own only db_data, got %+v", aVolumes)
+	}
+
+	bVolumes, ok := groups["container-b"]
+	if !ok || len(bVolumes) != 1 || bVolumes[0].Name != "cache_data" {
+		t.Fatalf("expected container-b to own only cache_data, got %+v", bVolumes)
 	}
 }
 

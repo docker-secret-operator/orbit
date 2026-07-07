@@ -449,6 +449,89 @@ func TestLoadCurrentActiveGenerationUnsafe(t *testing.T) {
 }
 
 // ============================================================================
+// WriteRolloutState CAS Tests
+// ============================================================================
+
+func TestWriteRolloutState_FirstWrite_Succeeds(t *testing.T) {
+	tmpDir := t.TempDir()
+	sm := NewStateManager(tmpDir, nil)
+
+	rs := &RolloutState{
+		SchemaVersion: 1,
+		Service:       "web",
+		OldGeneration: "gen-1",
+		NewGeneration: "gen-2",
+		Phase:         RolloutDraining,
+		Authority:     AuthorityOld,
+	}
+
+	if err := sm.WriteRolloutState(rs, nil); err != nil {
+		t.Fatalf("first write should succeed: %v", err)
+	}
+	if rs.Revision == 0 {
+		t.Error("expected Revision to be set after write")
+	}
+}
+
+func TestWriteRolloutState_StaleWrite_Rejected(t *testing.T) {
+	tmpDir := t.TempDir()
+	sm := NewStateManager(tmpDir, nil)
+
+	first := &RolloutState{
+		SchemaVersion: 1,
+		Service:       "web",
+		OldGeneration: "gen-1",
+		NewGeneration: "gen-2",
+		Phase:         RolloutDraining,
+		Authority:     AuthorityOld,
+	}
+	if err := sm.WriteRolloutState(first, nil); err != nil {
+		t.Fatalf("first write failed: %v", err)
+	}
+
+	// A second writer reads the same state concurrently, then a third
+	// writer updates it first...
+	second := &RolloutState{
+		SchemaVersion:    1,
+		Service:          "web",
+		OldGeneration:    "gen-1",
+		NewGeneration:    "gen-2",
+		Phase:            RolloutCommitting,
+		Authority:        AuthorityTransitioning,
+		PreviousRevision: first.Revision,
+	}
+	if err := sm.WriteRolloutState(second, nil); err != nil {
+		t.Fatalf("second write (valid CAS) failed: %v", err)
+	}
+
+	// ...now the second writer's stale in-memory copy (still carrying the
+	// FIRST write's revision as PreviousRevision) tries to write — this must
+	// be rejected, not silently overwrite the third writer's update.
+	stale := &RolloutState{
+		SchemaVersion:    1,
+		Service:          "web",
+		OldGeneration:    "gen-1",
+		NewGeneration:    "gen-2",
+		Phase:            RolloutCompleted,
+		Authority:        AuthorityNew,
+		PreviousRevision: first.Revision, // stale: doesn't match `second`'s revision
+	}
+	if err := sm.WriteRolloutState(stale, nil); err == nil {
+		t.Fatal("expected stale write (wrong PreviousRevision) to be rejected")
+	}
+
+	// Confirm the on-disk state still reflects `second`, not the rejected
+	// stale write.
+	loaded, err := sm.LoadRolloutState("web")
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	if loaded.Phase != RolloutCommitting {
+		t.Errorf("expected on-disk phase to remain %q after rejected stale write, got %q", RolloutCommitting, loaded.Phase)
+	}
+}
+
+// ============================================================================
 // Lock Timeout Tests
 // ============================================================================
 

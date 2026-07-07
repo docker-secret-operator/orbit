@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,6 +108,51 @@ func TestSaveState(t *testing.T) {
 	stateFile := filepath.Join(tmpDir, "state-service1.json")
 	if !pathExists(stateFile) {
 		t.Errorf("state file not created at %s", stateFile)
+	}
+}
+
+func TestSaveState_MultipleServices_PicksDeterministically(t *testing.T) {
+	log := zap.NewNop()
+
+	buildRollout := func() *StackRollout {
+		config := &StackRolloutConfig{}
+		rollout := NewStackRollout(config, log)
+		rollout.state.ServiceStates["zeta"] = &ServiceRolloutState{Status: StatusRolling}
+		rollout.state.ServiceStates["alpha"] = &ServiceRolloutState{Status: StatusCompleted}
+		rollout.state.ServiceStates["mid"] = &ServiceRolloutState{Status: StatusFailed}
+		return rollout
+	}
+
+	var chosenFiles []string
+	for i := 0; i < 10; i++ {
+		tmpDir := t.TempDir()
+		sp, _ := NewStatePersistence(tmpDir, log)
+
+		if err := sp.SaveState(buildRollout(), TxnCompleted); err != nil {
+			t.Fatalf("SaveState failed: %v", err)
+		}
+		sp.Close()
+
+		entries, err := os.ReadDir(tmpDir)
+		if err != nil {
+			t.Fatalf("failed to read state dir: %v", err)
+		}
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "state-") {
+				chosenFiles = append(chosenFiles, e.Name())
+			}
+		}
+	}
+
+	first := chosenFiles[0]
+	for _, name := range chosenFiles {
+		if name != first {
+			t.Fatalf("SaveState picked a different service across runs: got %v", chosenFiles)
+		}
+	}
+
+	if first != "state-alpha.json" {
+		t.Fatalf("expected deterministic pick of lexicographically-first service (alpha), got %s", first)
 	}
 }
 
@@ -301,6 +347,71 @@ func TestWALEntryChecksum(t *testing.T) {
 		if entry.Checksum == "" {
 			t.Error("WAL entry checksum not set")
 		}
+	}
+}
+
+func TestWALChecksum_DifferentContentProducesDifferentChecksum(t *testing.T) {
+	tmpDir := t.TempDir()
+	log := zap.NewNop()
+	sp, _ := NewStatePersistence(tmpDir, log)
+	defer sp.Close()
+
+	sp.LogOperation("create", "service-a", map[string]string{"image": "img:v1"})
+	sp.LogOperation("create", "service-b", map[string]string{"image": "img:v2"})
+
+	if sp.walEntries[0].Checksum == sp.walEntries[1].Checksum {
+		t.Fatal("expected different content to produce different checksums")
+	}
+
+	// A checksum that's just hex(len(data)) would collide whenever the two
+	// concatenated strings happen to have the same length, and wouldn't
+	// change at all if only the Data payload (not operation+service) changed.
+	sp2, _ := NewStatePersistence(t.TempDir(), log)
+	defer sp2.Close()
+	sp2.LogOperation("create", "service-a", map[string]string{"image": "img:v1"})
+	sp2.LogOperation("create", "service-a", map[string]string{"image": "img:DIFFERENT"})
+
+	if sp2.walEntries[0].Checksum == sp2.walEntries[1].Checksum {
+		t.Fatal("expected different Data payload to produce different checksums")
+	}
+}
+
+func TestReadWAL_SkipsEntryWithTamperedChecksum(t *testing.T) {
+	tmpDir := t.TempDir()
+	log := zap.NewNop()
+	sp, _ := NewStatePersistence(tmpDir, log)
+	defer sp.Close()
+
+	sp.LogOperation("create", "service1", map[string]string{"image": "img:latest"})
+	sp.LogOperation("start", "service1", nil)
+	sp.walFile.Sync()
+
+	// Tamper with the WAL file on disk: rewrite the first entry's Operation
+	// field without updating its Checksum, simulating on-disk corruption.
+	walBytes, err := os.ReadFile(sp.walPath)
+	if err != nil {
+		t.Fatalf("failed to read WAL file: %v", err)
+	}
+	tampered := []byte(strings.Replace(string(walBytes), `"operation":"create"`, `"operation":"TAMPERED"`, 1))
+	if err := os.WriteFile(sp.walPath, tampered, 0640); err != nil {
+		t.Fatalf("failed to write tampered WAL file: %v", err)
+	}
+
+	entries, err := sp.ReadWAL()
+	if err != nil {
+		t.Fatalf("ReadWAL failed: %v", err)
+	}
+
+	for _, e := range entries {
+		if e.Operation == "TAMPERED" {
+			t.Fatal("expected tampered entry to be rejected by checksum verification, but it was returned")
+		}
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 valid entry (tampered one skipped), got %d", len(entries))
+	}
+	if entries[0].Operation != "start" {
+		t.Fatalf("expected remaining entry to be 'start', got %q", entries[0].Operation)
 	}
 }
 

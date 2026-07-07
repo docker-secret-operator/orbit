@@ -805,8 +805,19 @@ func findOldContainer(ctx context.Context, service, newID string) (string, error
 	if err != nil {
 		return "", fmt.Errorf("docker ps: %w", err)
 	}
-	for _, id := range strings.Fields(string(out)) {
-		if !strings.HasPrefix(newID, id) && !strings.HasPrefix(id, newID[:12]) {
+	return selectOldContainer(strings.Fields(string(out)), newID, service)
+}
+
+// selectOldContainer picks the first candidate ID that is not newID (by
+// prefix match in either direction, since Docker IDs can appear truncated or
+// full-length depending on the source). Uses shortID rather than slicing
+// newID directly — newID can be shorter than 12 characters (a mocked
+// runtime, or a future Docker output format change), and a raw newID[:12]
+// would panic in that case.
+func selectOldContainer(candidateIDs []string, newID, service string) (string, error) {
+	newShort := shortID(newID)
+	for _, id := range candidateIDs {
+		if !strings.HasPrefix(newID, id) && !strings.HasPrefix(id, newShort) {
 			return id, nil
 		}
 	}

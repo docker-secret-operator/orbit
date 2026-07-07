@@ -67,9 +67,9 @@ func TestEmitEvent(t *testing.T) {
 	log := zap.NewNop()
 	oh := NewObservabilityHooks(log)
 
-	hookCalled := false
+	called := make(chan struct{}, 1)
 	oh.RegisterHook("test", func(event *MetricEvent) error {
-		hookCalled = true
+		called <- struct{}{}
 		return nil
 	})
 
@@ -81,9 +81,9 @@ func TestEmitEvent(t *testing.T) {
 
 	oh.EmitEvent(event)
 
-	time.Sleep(100 * time.Millisecond)
-
-	if !hookCalled {
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
 		t.Error("hook not called")
 	}
 }
@@ -397,6 +397,31 @@ func TestEmitEventAsynchronous(t *testing.T) {
 	}
 
 	close(blockChan)
+}
+
+// TestEmitEvent_HookPanicDoesNotCrashProcess guards EmitEvent's per-hook
+// goroutine: a panicking hook must not take down the whole process, and
+// well-behaved hooks registered alongside it must still run.
+func TestEmitEvent_HookPanicDoesNotCrashProcess(t *testing.T) {
+	log := zap.NewNop()
+	oh := NewObservabilityHooks(log)
+
+	goodHookCalled := make(chan struct{}, 1)
+	oh.RegisterHook("panicky", func(event *MetricEvent) error {
+		panic("boom")
+	})
+	oh.RegisterHook("good", func(event *MetricEvent) error {
+		goodHookCalled <- struct{}{}
+		return nil
+	})
+
+	oh.EmitEvent(&MetricEvent{Type: "rollout_start", Service: "s1"})
+
+	select {
+	case <-goodHookCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("well-behaved hook was not called (panicking hook may have crashed the process/goroutine group)")
+	}
 }
 
 func TestMultipleHooks(t *testing.T) {

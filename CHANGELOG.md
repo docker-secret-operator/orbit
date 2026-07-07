@@ -104,16 +104,19 @@ Three new commands, each answering one of Orbit's Product Philosophy questions (
 
 ### CI/CD
 
-- Split the test suite into a fast, deterministic blocking gate (`internal/api`, `compose`, `config`, `metrics`, `plugin`, `proxy`, `rollout`, `volumes`, `testing/concurrency`, `testing/profile` — passes cleanly in ~28s) and a non-blocking "known issues" step (`internal/stack`, `internal/state` — see Known Issues below).
+- Split the test suite into a fast, deterministic blocking gate (`internal/api`, `compose`, `config`, `metrics`, `plugin`, `proxy`, `rollout`, `volumes`, `testing/concurrency`, `testing/profile` — passes cleanly in ~28s) and a non-blocking "known issues" step (`internal/stack`, `internal/state`). Both packages' known issues are now fixed (see below); they've been promoted back into the blocking gate and the separate step removed.
 - Added a separate `soak.yml` workflow (nightly + manual dispatch) for `internal/testing/chaos` (multi-tier chaos scenarios) and `internal/testing/benchmark` (5×60s extended load tests) — these no longer run on every push/PR.
 - Added a `golangci-lint` step to CI (was previously only available via `make lint`, never actually enforced on PRs despite `docs/governance/QUALITY.md` claiming it was).
 - Added a `govulncheck` security scanning step (previously no vulnerability scanning existed in CI at all).
 
 ### Known Issues (tracked, not yet fixed)
 
-- `internal/stack`: data races in the mock Docker client / transaction test harness (`TestEmitEvent`, `TestTransactionFullRollout`, and possibly others — races are non-deterministic under `-race`). Package passes without `-race`. Not a product-code defect as far as isolated so far — confined to test infrastructure.
-- `internal/state`: `TestIsTransitionStaleWithProgress` fails deterministically (100% reproduction, with and without `-race`) — a genuine recovery-algorithm bug in the stale-transition-detection logic for the "slow-but-healthy drain with recent progress" scenario. This touches the "Deterministic crash recovery" guarantee in `CONSTITUTION.md`'s Product Contract and should be prioritized before a v1.0 tag.
 - `internal/rollout`: `TestAcquireLockSuccess`, `TestAcquireLockBlocked`, `TestGetProcessStartTicks`, `TestIsProcessAlive`, `TestLockRelease`, `TestLockMetadataPreserved` fail on macOS — `lock.go`'s process-liveness check reads `/proc/[pid]/stat`, which is Linux-only (already documented as such in the code's own comments). These pass on Linux (including CI, which runs on `ubuntu-latest`) and are a local macOS-dev-only artifact, not a product defect; a real cross-platform fix (e.g. `kill(pid, 0)` + a platform-appropriate start-time source) is Phase 4 (Production Hardening) scope, not addressed here.
+
+### Resolved Known Issues
+
+- `internal/stack`: the data races in the mock Docker client / transaction test harness (`TestEmitEvent`, `TestTransactionFullRollout`) are fixed — `TestEmitEvent` now synchronizes on a channel instead of a racy bool+sleep, and `MockDockerClient` now guards its maps with a mutex (plus a `SetContainerHealth` helper for tests that flip health from a background goroutine). Package is `-race`-clean. Note: `internal/stack` is still experimental and unwired from the CLI (see `internal/stack/README.md`) — this only means its own tests no longer destabilize the blocking gate, not that the package is used in v1 deployments.
+- `internal/state`: `TestIsTransitionStaleWithProgress` now passes — the progress-aware staleness fix already recorded above under "Fixed" resolved it; this entry just removes it from Known Issues to match. Package is `-race`-clean.
 
 ## Earlier History (pre-changelog, reconstructed from commit log)
 

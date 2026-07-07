@@ -116,6 +116,37 @@ func TestServer_EndToEnd_TCPProxy(t *testing.T) {
 	}
 }
 
+// TestServer_NilMetrics_DoesNotPanic guards NewServer(..., nil): every
+// connection path (ConnStart/ConnEnd/ConnFailed/failover counters) calls
+// s.metrics methods unconditionally with no nil check, unlike the
+// FailoverMetrics/HealthMetrics interfaces elsewhere in this package which
+// are nil-checked before use. Today's only call site always passes
+// metrics.New(), but nil must not panic.
+func TestServer_NilMetrics_DoesNotPanic(t *testing.T) {
+	reg := proxy.NewRegistry()
+	router := proxy.NewRouter(reg)
+	srv := proxy.NewServer(router, nopLogger(), nil)
+	t.Cleanup(srv.Close)
+
+	echoAddr := echoServer(t)
+	reg.Add(proxy.Backend{ID: "echo", Addr: echoAddr}) //nolint:errcheck
+
+	if err := srv.Bind(proxy.PortBinding{ListenPort: 0}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	proxyPort := srv.Bindings()[0].ListenPort
+
+	conn := dialTimeout(t, fmt.Sprintf("127.0.0.1:%d", proxyPort))
+	msg := []byte("hello\n")
+	conn.Write(msg) //nolint:errcheck
+
+	buf := make([]byte, len(msg))
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read from echo (nil metrics should not have panicked the conn handler): %v", err)
+	}
+}
+
 func TestServer_NoBackend_ConnectionDropped(t *testing.T) {
 	_, srv := newTestServer(t)                 // empty registry
 	srv.Bind(proxy.PortBinding{ListenPort: 0}) //nolint:errcheck

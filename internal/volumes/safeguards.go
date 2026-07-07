@@ -2,9 +2,9 @@ package volumes
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -33,20 +33,12 @@ func (vm *VolumeManager) PreventConcurrentAccess(ctx context.Context, containerI
 		return wasRW, nil
 	}
 
-	// Mount read-only using docker update
-	// Note: This is a simplified approach. A production system would need to:
-	// 1. Verify the container is running
-	// 2. Handle different mount types
-	// 3. Deal with mount point paths
-	cmd := exec.CommandContext(ctx, "docker", "update", "--read-only=true", containerID)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		vm.log.Warn("failed to mount read-only via docker update",
-			zap.String("container", containerID),
-			zap.String("output", string(output)),
-			zap.Error(err))
-		// Fallback: Check if we can detect it manually was successful
-		// For now, log the error but don't fail - the volume may already be protected
-		return wasRW, nil
+	// docker update has no --read-only flag; a running container's mount mode
+	// can't be changed through the Docker API without recreating it. Instead,
+	// remount the filesystem read-only from inside the container's own mount
+	// namespace via docker exec.
+	if err := vm.runner.Run(ctx, nil, "docker", "exec", containerID, "mount", "-o", "remount,ro", volumeName); err != nil {
+		return wasRW, fmt.Errorf("failed to remount %s read-only on container %s: %w", volumeName, containerID, err)
 	}
 
 	vm.log.Info("volume mounted read-only",
@@ -57,34 +49,48 @@ func (vm *VolumeManager) PreventConcurrentAccess(ctx context.Context, containerI
 	return wasRW, nil
 }
 
-// TemporarySnapshot creates a temporary backup of a volume's current state.
-// This is optional but useful for critical data like databases.
-// Returns the path to the snapshot file.
+// TemporarySnapshot creates a temporary backup of a volume's current state by
+// running a throwaway container that tars the volume's contents to stdout,
+// which is streamed straight to the snapshot file. Returns the path to the
+// snapshot file, which is only returned once its contents are confirmed
+// non-empty.
 func (vm *VolumeManager) TemporarySnapshot(ctx context.Context, volumeName string) (snapshotPath string, err error) {
 	vm.log.Info("creating temporary snapshot",
 		zap.String("volume", volumeName))
 
-	// Generate snapshot filename with timestamp
 	timestamp := time.Now().Format("2006-01-02-15-04-05")
-	snapshotPath = filepath.Join("/tmp", fmt.Sprintf("orbit-snapshot-%s-%s.tar.gz", volumeName, timestamp))
+	snapshotPath = filepath.Join(os.TempDir(), fmt.Sprintf("orbit-snapshot-%s-%s.tar.gz", volumeName, timestamp))
 
-	// In a real implementation, we would:
-	// 1. Find the volume's actual mount point
-	// 2. Use docker cp or tar to snapshot contents
-	// 3. Compress the snapshot
-	// 4. Verify integrity
-	//
-	// For now, we'll create a placeholder and log the operation
-	vm.log.Debug("snapshot would be created",
+	out, createErr := os.Create(snapshotPath)
+	if createErr != nil {
+		return "", fmt.Errorf("failed to create snapshot file: %w", createErr)
+	}
+	defer out.Close()
+
+	runErr := vm.runner.Run(ctx, out, "docker", "run", "--rm",
+		"-v", volumeName+":/data:ro",
+		"alpine:latest", "tar", "-czf", "-", "-C", "/data", ".")
+	if runErr != nil {
+		out.Close()
+		os.Remove(snapshotPath)
+		return "", fmt.Errorf("failed to snapshot volume %s: %w", volumeName, runErr)
+	}
+
+	info, statErr := out.Stat()
+	if statErr != nil {
+		os.Remove(snapshotPath)
+		return "", fmt.Errorf("failed to verify snapshot for volume %s: %w", volumeName, statErr)
+	}
+	if info.Size() == 0 {
+		os.Remove(snapshotPath)
+		return "", fmt.Errorf("snapshot for volume %s is empty", volumeName)
+	}
+
+	vm.log.Info("snapshot created",
 		zap.String("path", snapshotPath),
-		zap.String("volume", volumeName))
+		zap.String("volume", volumeName),
+		zap.Int64("size_bytes", info.Size()))
 
-	// In production, you'd do something like:
-	// cmd := exec.CommandContext(ctx, "docker", "run", "--rm",
-	//   "-v", volumeName+":/data:ro",
-	//   "alpine:latest", "tar", "-czf", "-", "/data")
-	//
-	// For now, just track that we attempted it
 	return snapshotPath, nil
 }
 
@@ -131,6 +137,7 @@ func (vm *VolumeManager) RestoreVolumeState(ctx context.Context, oldContainerID 
 	}
 
 	// Restore each volume to its original state
+	var errs []error
 	for _, vol := range volumes {
 		vm.log.Debug("restoring volume",
 			zap.String("volume", vol.Name),
@@ -139,14 +146,13 @@ func (vm *VolumeManager) RestoreVolumeState(ctx context.Context, oldContainerID 
 
 		// If volume was read-write before, restore it to read-write
 		if !vol.ReadOnly {
-			cmd := exec.CommandContext(ctx, "docker", "update", "--read-only=false", oldContainerID)
-			if output, err := cmd.CombinedOutput(); err != nil {
+			if err := vm.runner.Run(ctx, nil, "docker", "exec", oldContainerID, "mount", "-o", "remount,rw", vol.MountPath); err != nil {
 				vm.log.Warn("failed to restore read-write mode",
 					zap.String("container", oldContainerID),
 					zap.String("volume", vol.Name),
-					zap.String("output", string(output)),
 					zap.Error(err))
-				// Don't fail the whole restore if one volume has issues
+				errs = append(errs, fmt.Errorf("volume %s: %w", vol.Name, err))
+				// Keep restoring the remaining volumes even if one fails
 				continue
 			}
 		}
@@ -156,7 +162,7 @@ func (vm *VolumeManager) RestoreVolumeState(ctx context.Context, oldContainerID 
 		zap.String("container", oldContainerID),
 		zap.Int("volume_count", len(volumes)))
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // CleanupSnapshot removes a temporary snapshot file created by TemporarySnapshot.

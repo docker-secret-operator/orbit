@@ -3,15 +3,29 @@ package stack
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
 )
 
 // StackRollout orchestrates multi-service deployments with dependency management.
+//
+// mu guards every read and write of state (the ServiceStates map, its
+// *ServiceRolloutState/*CircuitBreakerState values, and the top-level
+// slices/flags): HealthMonitor drives health checks from its own background
+// goroutine (see health_monitor.go's monitorServiceHealth), which mutates
+// this same state concurrently with whatever goroutine is driving the
+// rollout itself. Every file in this package that touches `.state` directly
+// (docker_integration.go, docker_transaction.go, health_check.go,
+// health_monitor.go, network_policy.go, state_persistence.go) must hold mu
+// for the duration of that access. Never hold mu across blocking I/O
+// (Docker API calls, time.Sleep) — lock only around the state read/write
+// itself.
 type StackRollout struct {
 	config *StackRolloutConfig
 	log    *zap.Logger
+	mu     sync.Mutex
 	state  *StackRolloutState
 }
 
@@ -109,7 +123,9 @@ func (sr *StackRollout) BuildDependencyGraph(services map[string]*ServiceDepende
 		return nil, fmt.Errorf("failed to build dependency graph: %w", err)
 	}
 
+	sr.mu.Lock()
 	sr.state.Graph = graph
+	sr.mu.Unlock()
 
 	sr.log.Info("dependency graph built",
 		zap.Int("levels", graph.GetLevelCount()),
@@ -120,6 +136,9 @@ func (sr *StackRollout) BuildDependencyGraph(services map[string]*ServiceDepende
 
 // CheckLevelReadiness verifies that all dependencies of a level are completed and healthy.
 func (sr *StackRollout) CheckLevelReadiness(level int) (bool, []string) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
 	if sr.state.Graph == nil {
 		return false, []string{"no dependency graph"}
 	}
@@ -156,6 +175,9 @@ func (sr *StackRollout) CheckLevelReadiness(level int) (bool, []string) {
 
 // GetRolloutPlan returns the services grouped by level for rollout execution.
 func (sr *StackRollout) GetRolloutPlan() [][]string {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
 	if sr.state.Graph == nil {
 		return [][]string{}
 	}
@@ -164,6 +186,7 @@ func (sr *StackRollout) GetRolloutPlan() [][]string {
 
 // InitializeServiceStates creates tracking state for all services.
 func (sr *StackRollout) InitializeServiceStates(services map[string]*ServiceDependency) {
+	sr.mu.Lock()
 	for service := range services {
 		sr.state.ServiceStates[service] = &ServiceRolloutState{
 			Service: service,
@@ -174,24 +197,23 @@ func (sr *StackRollout) InitializeServiceStates(services map[string]*ServiceDepe
 			},
 		}
 	}
+	count := len(sr.state.ServiceStates)
+	sr.mu.Unlock()
 
 	sr.log.Info("initialized service states",
-		zap.Int("service_count", len(sr.state.ServiceStates)))
+		zap.Int("service_count", count))
 }
 
 // UpdateServiceStatus updates the rollout status of a service.
 func (sr *StackRollout) UpdateServiceStatus(service string, status ServiceStatus, err error) {
-	if state, ok := sr.state.ServiceStates[service]; ok {
+	sr.mu.Lock()
+	state, ok := sr.state.ServiceStates[service]
+	if ok {
 		state.Status = status
 		if err != nil {
 			state.Error = err
 		}
 		state.CompletedAt = time.Now()
-
-		sr.log.Info("service status updated",
-			zap.String("service", service),
-			zap.String("status", string(status)),
-			zap.Error(err))
 
 		// Track completion
 		if status == StatusCompleted {
@@ -201,12 +223,26 @@ func (sr *StackRollout) UpdateServiceStatus(service string, status ServiceStatus
 			sr.state.NeedsRollback = true
 		}
 	}
+	sr.mu.Unlock()
+
+	if ok {
+		sr.log.Info("service status updated",
+			zap.String("service", service),
+			zap.String("status", string(status)),
+			zap.Error(err))
+	}
 }
 
 // MarkServiceHealthy marks a service's health check as passed.
 func (sr *StackRollout) MarkServiceHealthy(service string) {
-	if state, ok := sr.state.ServiceStates[service]; ok {
-		state.HealthCheckPassed = true
+	sr.mu.Lock()
+	_, ok := sr.state.ServiceStates[service]
+	if ok {
+		sr.state.ServiceStates[service].HealthCheckPassed = true
+	}
+	sr.mu.Unlock()
+
+	if ok {
 		sr.log.Debug("service marked healthy",
 			zap.String("service", service))
 	}
@@ -214,8 +250,14 @@ func (sr *StackRollout) MarkServiceHealthy(service string) {
 
 // MarkServiceUnhealthy marks a service's health check as failed.
 func (sr *StackRollout) MarkServiceUnhealthy(service string) {
-	if state, ok := sr.state.ServiceStates[service]; ok {
-		state.HealthCheckPassed = false
+	sr.mu.Lock()
+	_, ok := sr.state.ServiceStates[service]
+	if ok {
+		sr.state.ServiceStates[service].HealthCheckPassed = false
+	}
+	sr.mu.Unlock()
+
+	if ok {
 		sr.log.Warn("service marked unhealthy",
 			zap.String("service", service))
 	}
@@ -223,8 +265,14 @@ func (sr *StackRollout) MarkServiceUnhealthy(service string) {
 
 // MarkDependenciesReady marks all dependencies of a service as ready.
 func (sr *StackRollout) MarkDependenciesReady(service string) {
-	if state, ok := sr.state.ServiceStates[service]; ok {
-		state.DependenciesReady = true
+	sr.mu.Lock()
+	_, ok := sr.state.ServiceStates[service]
+	if ok {
+		sr.state.ServiceStates[service].DependenciesReady = true
+	}
+	sr.mu.Unlock()
+
+	if ok {
 		sr.log.Debug("dependencies marked ready",
 			zap.String("service", service))
 	}
@@ -232,6 +280,9 @@ func (sr *StackRollout) MarkDependenciesReady(service string) {
 
 // GetMetrics returns current rollout metrics and statistics.
 func (sr *StackRollout) GetMetrics() *StackMetrics {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
 	metrics := &StackMetrics{
 		TotalServices:     len(sr.state.ServiceStates),
 		CompletedServices: len(sr.state.CompletedServices),
@@ -282,6 +333,9 @@ func (sr *StackRollout) GetMetrics() *StackMetrics {
 
 // CanProceedWithRollout checks if we can proceed to rollout the next level.
 func (sr *StackRollout) CanProceedWithRollout(currentLevel int) (bool, string) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
 	if sr.state.NeedsRollback {
 		return false, "rollback needed due to previous service failure"
 	}
@@ -314,7 +368,11 @@ func (sr *StackRollout) CanProceedWithRollout(currentLevel int) (bool, string) {
 	return true, ""
 }
 
-// GetRolloutState returns the current state of the rollout.
+// GetRolloutState returns the current state of the rollout. The returned
+// pointer's top-level slices/map are the live, mutex-guarded rollout state —
+// callers outside this package's lock must not read/write through it
+// concurrently with a running rollout. Currently unused outside this
+// package; prefer the locked accessor methods on StackRollout instead.
 func (sr *StackRollout) GetRolloutState() *StackRolloutState {
 	return sr.state
 }

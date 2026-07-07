@@ -127,7 +127,9 @@ func Scenario6_RecoveryRaceCondition(ctx context.Context, h *ChaosHarness) error
 		ActiveGeneration: "gen-1",
 		Revision:         1,
 	}
-	state.AtomicWriteJSON(filePath, initial, nil)
+	if err := state.AtomicWriteJSON(filePath, initial, nil); err != nil {
+		return fmt.Errorf("initial state write failed: %w", err)
+	}
 
 	// Spawn competing recovery attempts
 	done := make(chan error, 2)
@@ -140,15 +142,17 @@ func Scenario6_RecoveryRaceCondition(ctx context.Context, h *ChaosHarness) error
 			}
 			defer lock.Release()
 
-			updated := initial
+			updated := *initial // copy: initial is shared between both goroutines
 			updated.Revision++
-			err = state.AtomicWriteJSON(filePath, updated, nil)
+			err = state.AtomicWriteJSON(filePath, &updated, nil)
 			done <- err
 		}()
 	}
 
 	for i := 0; i < 2; i++ {
-		<-done
+		if err := <-done; err != nil {
+			return fmt.Errorf("concurrent recovery write failed: %w", err)
+		}
 	}
 
 	return nil
@@ -296,15 +300,28 @@ func Scenario12_ConcurrentHealthChecks(ctx context.Context, h *ChaosHarness) err
 
 // Scenario13_OrphanAccumulation simulates orphan generation buildup
 func Scenario13_OrphanAccumulation(ctx context.Context, h *ChaosHarness) error {
-	// Create 20 generations but only track 1 as active
+	// Persist 20 successive generations but only ever track the latest one
+	// as active — orphan accumulation is exactly this shape: N generations
+	// have existed, only 1 is referenced by the current active-generation
+	// pointer. Each write goes through the real CAS-protected write path so
+	// PreviousRevision must track whatever the prior write actually landed
+	// — starting from whatever revision (if any) other scenarios sharing
+	// this harness's state dir have already left behind.
+	var previousRevision int64
+	if current, err := h.sm.LoadActiveGenerationState("web"); err == nil && current != nil {
+		previousRevision = current.Revision
+	}
 	for i := 0; i < 20; i++ {
 		s := &state.ActiveGenerationState{
 			SchemaVersion:    1,
 			Service:          "web",
 			ActiveGeneration: fmt.Sprintf("gen-%d", i),
-			Revision:         int64(i + 1),
+			PreviousRevision: previousRevision,
 		}
-		_ = s // Would be written to state in real scenario
+		if err := h.sm.WriteActiveGenerationState(s, nil); err != nil {
+			return fmt.Errorf("write generation %d failed: %w", i, err)
+		}
+		previousRevision = s.Revision
 	}
 
 	return nil
@@ -312,14 +329,20 @@ func Scenario13_OrphanAccumulation(ctx context.Context, h *ChaosHarness) error {
 
 // Scenario14_RolloutFailure simulates failed rollout transition
 func Scenario14_RolloutFailure(ctx context.Context, h *ChaosHarness) error {
-	// Create rollout state in failed phase
+	// Persist rollout state in a failed/draining phase so post-scenario
+	// invariant validation actually sees a rollout in progress.
 	rollout := &state.RolloutState{
+		SchemaVersion: 1,
+		Service:       "web",
 		OldGeneration: "gen-old",
 		NewGeneration: "gen-new",
 		Phase:         state.RolloutDraining,
 		Authority:     state.AuthorityOld,
+		StartedAt:     time.Now(),
 	}
-	_ = rollout // Would be persisted in real scenario
+	if err := h.sm.WriteRolloutState(rollout, nil); err != nil {
+		return fmt.Errorf("write rollout state failed: %w", err)
+	}
 
 	return nil
 }
@@ -451,8 +474,11 @@ func Scenario20_AuthorityOscillationLong(ctx context.Context, h *ChaosHarness) e
 			Revision:         int64(i + 1),
 		}
 
-		state.AtomicWriteJSON(filePath, s, nil)
+		writeErr := state.AtomicWriteJSON(filePath, s, nil)
 		lock.Release()
+		if writeErr != nil {
+			return fmt.Errorf("state write failed on iteration %d: %w", i, writeErr)
+		}
 
 		time.Sleep(250 * time.Millisecond)
 	}
@@ -494,7 +520,9 @@ func Scenario22_FullSystemDegradation(ctx context.Context, h *ChaosHarness) erro
 				ActiveGeneration: fmt.Sprintf("gen-%d-%d", i, j),
 				Revision:         int64(i*5 + j),
 			}
-			state.AtomicWriteJSON(filePath, s, nil)
+			if err := state.AtomicWriteJSON(filePath, s, nil); err != nil {
+				return fmt.Errorf("state write failed at iteration %d.%d: %w", i, j, err)
+			}
 		}
 
 		time.Sleep(300 * time.Millisecond)
@@ -561,12 +589,16 @@ func Scenario25_ComplexFailureChain(ctx context.Context, h *ChaosHarness) error 
 			ActiveGeneration: fmt.Sprintf("gen-phase-%d", phase),
 			Revision:         int64(phase + 1),
 		}
-		state.AtomicWriteJSON(filePath, s, nil)
+		writeErr := state.AtomicWriteJSON(filePath, s, nil)
 
 		// Phase 4: Cleanup
 		done()
 		if lock != nil {
 			lock.Release()
+		}
+
+		if writeErr != nil {
+			return fmt.Errorf("state write failed at phase %d: %w", phase, writeErr)
 		}
 
 		time.Sleep(200 * time.Millisecond)

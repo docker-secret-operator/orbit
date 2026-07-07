@@ -436,9 +436,20 @@ func executeRecovery(
 	var plan *state.RecoveryPlan
 	startupState := proxy.StartupRecovering
 
-	// Load persistent states (ActiveGenerationState, RolloutState).
-	activeGenState, _ := sm.LoadActiveGenerationState(cfg.ProxyInstance)
-	rolloutState, _ := sm.LoadRolloutState(cfg.ProxyInstance)
+	// Load persistent states (ActiveGenerationState, RolloutState). Both
+	// return (nil, nil) when no state file exists yet — a non-nil error here
+	// means real corruption or an I/O failure, which must not be silently
+	// treated the same as "no prior state".
+	activeGenState, err := sm.LoadActiveGenerationState(cfg.ProxyInstance)
+	if err != nil {
+		log.Error("recovery: active generation state unreadable, proceeding as if absent",
+			zap.Error(err))
+	}
+	rolloutState, err := sm.LoadRolloutState(cfg.ProxyInstance)
+	if err != nil {
+		log.Error("recovery: rollout state unreadable, proceeding as if absent",
+			zap.Error(err))
+	}
 	debugHandler.RecordActiveGenState(activeGenState)
 	debugHandler.RecordRolloutState(rolloutState)
 

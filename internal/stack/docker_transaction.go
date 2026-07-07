@@ -76,6 +76,7 @@ func (t *RolloutTransaction) Execute() error {
 	}
 
 	// Save current state for rollback
+	t.rollout.mu.Lock()
 	if state, ok := t.rollout.state.ServiceStates[t.service]; ok {
 		t.savedOldState = &ServiceRolloutState{
 			Service:      state.Service,
@@ -84,6 +85,7 @@ func (t *RolloutTransaction) Execute() error {
 			NewContainer: state.NewContainer,
 		}
 	}
+	t.rollout.mu.Unlock()
 
 	t.state = TxnInProgress
 	t.log.Info("transaction started",
@@ -178,10 +180,12 @@ func (t *RolloutTransaction) rollback(failedIndex int) error {
 
 	// Restore saved state if we have it
 	if t.savedOldState != nil {
+		t.rollout.mu.Lock()
 		current := t.rollout.state.ServiceStates[t.service]
 		current.Status = t.savedOldState.Status
 		current.OldContainer = t.savedOldState.OldContainer
 		current.NewContainer = t.savedOldState.NewContainer
+		t.rollout.mu.Unlock()
 	}
 
 	t.log.Warn("transaction rolled back",
@@ -254,8 +258,10 @@ func (b *TransactionBuilder) AddCreateContainer(opts *RunOptions) *TransactionBu
 			}
 			containerID = id
 
+			b.transaction.rollout.mu.Lock()
 			state := b.transaction.rollout.state.ServiceStates[b.transaction.service]
 			state.NewContainer = containerID
+			b.transaction.rollout.mu.Unlock()
 			return nil
 		},
 		func() error {
@@ -274,16 +280,20 @@ func (b *TransactionBuilder) AddStartContainer() *TransactionBuilder {
 	b.transaction.AddOperation(
 		"start_container",
 		func() error {
-			state := b.transaction.rollout.state.ServiceStates[b.transaction.service]
-			if state.NewContainer == "" {
+			b.transaction.rollout.mu.Lock()
+			containerID := b.transaction.rollout.state.ServiceStates[b.transaction.service].NewContainer
+			b.transaction.rollout.mu.Unlock()
+			if containerID == "" {
 				return fmt.Errorf("no container to start")
 			}
-			return b.transaction.client.StartContainer(state.NewContainer)
+			return b.transaction.client.StartContainer(containerID)
 		},
 		func() error {
-			state := b.transaction.rollout.state.ServiceStates[b.transaction.service]
-			if state.NewContainer != "" {
-				return b.transaction.client.StopContainer(state.NewContainer, 5*time.Second)
+			b.transaction.rollout.mu.Lock()
+			containerID := b.transaction.rollout.state.ServiceStates[b.transaction.service].NewContainer
+			b.transaction.rollout.mu.Unlock()
+			if containerID != "" {
+				return b.transaction.client.StopContainer(containerID, 5*time.Second)
 			}
 			return nil
 		},
@@ -297,8 +307,10 @@ func (b *TransactionBuilder) AddHealthCheck(timeout time.Duration) *TransactionB
 	b.transaction.AddOperation(
 		"health_check",
 		func() error {
-			state := b.transaction.rollout.state.ServiceStates[b.transaction.service]
-			if state.NewContainer == "" {
+			b.transaction.rollout.mu.Lock()
+			containerID := b.transaction.rollout.state.ServiceStates[b.transaction.service].NewContainer
+			b.transaction.rollout.mu.Unlock()
+			if containerID == "" {
 				return fmt.Errorf("no container for health check")
 			}
 
@@ -308,7 +320,7 @@ func (b *TransactionBuilder) AddHealthCheck(timeout time.Duration) *TransactionB
 					return fmt.Errorf("health check timeout")
 				}
 
-				health, err := b.transaction.client.GetContainerHealth(state.NewContainer)
+				health, err := b.transaction.client.GetContainerHealth(containerID)
 				if err != nil {
 					return err
 				}
@@ -339,9 +351,9 @@ func (b *TransactionBuilder) AddSwitchTraffic() *TransactionBuilder {
 		"switch_traffic",
 		func() error {
 			// In real implementation, this would update load balancer/proxy
-			// For now, just mark transition
-			state := b.transaction.rollout.state.ServiceStates[b.transaction.service]
-			state.OldContainer = state.NewContainer
+			// For now, just mark transition. state.OldContainer already holds
+			// the previously-active container that AddCleanup should remove;
+			// state.NewContainer is the container taking over traffic.
 			return nil
 		},
 		func() error {
@@ -359,12 +371,14 @@ func (b *TransactionBuilder) AddDrainConnections(timeout time.Duration) *Transac
 	b.transaction.AddOperation(
 		"drain_connections",
 		func() error {
-			state := b.transaction.rollout.state.ServiceStates[b.transaction.service]
-			if state.OldContainer == "" {
+			b.transaction.rollout.mu.Lock()
+			oldContainer := b.transaction.rollout.state.ServiceStates[b.transaction.service].OldContainer
+			b.transaction.rollout.mu.Unlock()
+			if oldContainer == "" {
 				return nil // No old container to drain
 			}
 
-			_, err := b.transaction.client.WaitForContainer(state.OldContainer, timeout)
+			_, err := b.transaction.client.WaitForContainer(oldContainer, timeout)
 			return err
 		},
 		nil, // No rollback for drain
@@ -378,15 +392,20 @@ func (b *TransactionBuilder) AddCleanup() *TransactionBuilder {
 	b.transaction.AddOperation(
 		"cleanup",
 		func() error {
-			state := b.transaction.rollout.state.ServiceStates[b.transaction.service]
-			if state.OldContainer != "" {
-				if err := b.transaction.client.RemoveContainer(state.OldContainer, true); err != nil {
+			b.transaction.rollout.mu.Lock()
+			oldContainer := b.transaction.rollout.state.ServiceStates[b.transaction.service].OldContainer
+			b.transaction.rollout.mu.Unlock()
+
+			if oldContainer != "" {
+				if err := b.transaction.client.RemoveContainer(oldContainer, true); err != nil {
 					b.transaction.log.Warn("cleanup failed",
-						zap.String("container_id", state.OldContainer),
+						zap.String("container_id", oldContainer),
 						zap.Error(err))
 					// Don't fail the transaction on cleanup error
 				}
-				state.OldContainer = ""
+				b.transaction.rollout.mu.Lock()
+				b.transaction.rollout.state.ServiceStates[b.transaction.service].OldContainer = ""
+				b.transaction.rollout.mu.Unlock()
 			}
 			return nil
 		},

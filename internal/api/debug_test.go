@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -101,6 +102,67 @@ func TestDebugHandler(t *testing.T) {
 	if statusResp["recovery"] == nil {
 		t.Error("recovery section missing from status")
 	}
+}
+
+// TestDebugHandlerConcurrentRecordAndRead reproduces the real production
+// shape: RecordX calls happen from the recovery goroutine (proxy startup and
+// every POST /recover), while DebugFullStatus/DebugRolloutState are served
+// from concurrent HTTP handler goroutines hitting the unauthenticated
+// /status and /debug endpoints. Run with -race to catch unsynchronized
+// pointer read/write on the lastRecoveryPlan/lastRolloutState/
+// lastActiveGenState fields.
+func TestDebugHandlerConcurrentRecordAndRead(t *testing.T) {
+	sm := state.NewStateManager(t.TempDir(), nil)
+	mc := metrics.NewMetricsCollector()
+	dh := NewDebugHandler(sm, mc)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	writer := func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			dh.RecordRecoveryPlan(&state.RecoveryPlan{
+				Service: "web",
+				Epoch:   1,
+				Action:  state.RecoveryRestoreSingle,
+				DecisionTrace: []string{
+					"loaded state",
+				},
+			})
+			dh.RecordRolloutState(&state.RolloutState{OldGeneration: "web-1", NewGeneration: "web-2"})
+			dh.RecordActiveGenState(&state.ActiveGenerationState{ActiveGeneration: "web-2"})
+		}
+	}
+
+	reader := func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var buf bytes.Buffer
+			_ = dh.DebugFullStatus(&buf)
+			_ = dh.DebugRolloutState(&buf)
+		}
+	}
+
+	wg.Add(4)
+	go writer()
+	go writer()
+	go reader()
+	go reader()
+
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }
 
 func TestDebugRecoveryPlanNil(t *testing.T) {

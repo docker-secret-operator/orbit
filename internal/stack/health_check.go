@@ -33,6 +33,14 @@ func (sr *StackRollout) CheckServiceHealth(service string, config *HealthCheckCo
 		config = DefaultHealthCheckConfig()
 	}
 
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return sr.checkServiceHealthLocked(service, config)
+}
+
+// checkServiceHealthLocked is CheckServiceHealth's recursive core. Callers
+// must already hold sr.mu.
+func (sr *StackRollout) checkServiceHealthLocked(service string, config *HealthCheckConfig) (bool, error) {
 	state, ok := sr.state.ServiceStates[service]
 	if !ok {
 		return false, fmt.Errorf("service %q not found", service)
@@ -58,7 +66,7 @@ func (sr *StackRollout) CheckServiceHealth(service string, config *HealthCheckCo
 			}
 
 			// Check if dependency's circuit is open
-			if sr.IsCircuitOpen(dep) {
+			if sr.isCircuitOpenLocked(dep) {
 				sr.log.Debug("dependency circuit open",
 					zap.String("service", service),
 					zap.String("dependency", dep))
@@ -66,7 +74,7 @@ func (sr *StackRollout) CheckServiceHealth(service string, config *HealthCheckCo
 			}
 
 			// Recursively check dependency health
-			depHealthy, err := sr.CheckServiceHealth(dep, config)
+			depHealthy, err := sr.checkServiceHealthLocked(dep, config)
 			if err != nil {
 				return false, err
 			}
@@ -87,6 +95,9 @@ func (sr *StackRollout) RecordHealthCheckFailure(service string, config *HealthC
 	if config == nil {
 		config = DefaultHealthCheckConfig()
 	}
+
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
 
 	state, ok := sr.state.ServiceStates[service]
 	if !ok {
@@ -123,6 +134,9 @@ func (sr *StackRollout) RecordHealthCheckSuccess(service string, config *HealthC
 		config = DefaultHealthCheckConfig()
 	}
 
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
 	state, ok := sr.state.ServiceStates[service]
 	if !ok {
 		return
@@ -151,6 +165,13 @@ func (sr *StackRollout) RecordHealthCheckSuccess(service string, config *HealthC
 
 // IsCircuitOpen returns true if a service's circuit breaker is open or half-open.
 func (sr *StackRollout) IsCircuitOpen(service string) bool {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return sr.isCircuitOpenLocked(service)
+}
+
+// isCircuitOpenLocked is IsCircuitOpen's core. Callers must already hold sr.mu.
+func (sr *StackRollout) isCircuitOpenLocked(service string) bool {
 	state, ok := sr.state.ServiceStates[service]
 	if !ok || state.CircuitBreaker == nil {
 		return false
@@ -163,6 +184,9 @@ func (sr *StackRollout) CanAttemptHealthCheck(service string, config *HealthChec
 	if config == nil {
 		config = DefaultHealthCheckConfig()
 	}
+
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
 
 	state, ok := sr.state.ServiceStates[service]
 	if !ok || state.CircuitBreaker == nil {
@@ -196,6 +220,9 @@ func (sr *StackRollout) CanAttemptHealthCheck(service string, config *HealthChec
 
 // GetDependencyHealthStatus returns health status of all dependencies for a service.
 func (sr *StackRollout) GetDependencyHealthStatus(service string) map[string]bool {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
 	status := make(map[string]bool)
 
 	if sr.state.Graph == nil {
@@ -211,7 +238,7 @@ func (sr *StackRollout) GetDependencyHealthStatus(service string) map[string]boo
 		}
 
 		// Dependency is healthy if health check passed and no open circuit
-		status[dep] = depState.HealthCheckPassed && !sr.IsCircuitOpen(dep)
+		status[dep] = depState.HealthCheckPassed && !sr.isCircuitOpenLocked(dep)
 	}
 
 	return status
@@ -219,6 +246,9 @@ func (sr *StackRollout) GetDependencyHealthStatus(service string) map[string]boo
 
 // ValidateDependencyHealth checks if all dependencies of a service are healthy.
 func (sr *StackRollout) ValidateDependencyHealth(service string) (bool, []string) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
 	issues := make([]string, 0)
 
 	if sr.state.Graph == nil {
@@ -237,7 +267,7 @@ func (sr *StackRollout) ValidateDependencyHealth(service string) (bool, []string
 			issues = append(issues, fmt.Sprintf("dependency %q health check failed", dep))
 		}
 
-		if sr.IsCircuitOpen(dep) {
+		if sr.isCircuitOpenLocked(dep) {
 			issues = append(issues, fmt.Sprintf("dependency %q circuit breaker open", dep))
 		}
 	}
@@ -245,8 +275,11 @@ func (sr *StackRollout) ValidateDependencyHealth(service string) (bool, []string
 	return len(issues) == 0, issues
 }
 
-// GetCircuitBreakerStatus returns the current circuit breaker state for a service.
+// GetCircuitBreakerStatus returns a copy of the current circuit breaker state for a service.
 func (sr *StackRollout) GetCircuitBreakerStatus(service string) *CircuitBreakerState {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
 	state, ok := sr.state.ServiceStates[service]
 	if !ok || state.CircuitBreaker == nil {
 		return &CircuitBreakerState{
@@ -254,15 +287,19 @@ func (sr *StackRollout) GetCircuitBreakerStatus(service string) *CircuitBreakerS
 			FailureCount: 0,
 		}
 	}
-	return state.CircuitBreaker
+	cbCopy := *state.CircuitBreaker
+	return &cbCopy
 }
 
 // GetUnhealthyServices returns list of services with open circuits or failed health checks.
 func (sr *StackRollout) GetUnhealthyServices() []string {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
 	unhealthy := make([]string, 0)
 
 	for service, state := range sr.state.ServiceStates {
-		if !state.HealthCheckPassed || sr.IsCircuitOpen(service) {
+		if !state.HealthCheckPassed || sr.isCircuitOpenLocked(service) {
 			unhealthy = append(unhealthy, service)
 		}
 	}

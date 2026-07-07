@@ -83,23 +83,27 @@ func (hm *HealthMonitor) StartMonitoring(service string) error {
 		return fmt.Errorf("already monitoring service %q", service)
 	}
 
+	hm.rollout.mu.Lock()
 	state, ok := hm.rollout.state.ServiceStates[service]
 	if !ok {
+		hm.rollout.mu.Unlock()
 		return fmt.Errorf("service %q not found", service)
 	}
+	containerID := state.NewContainer
+	hm.rollout.mu.Unlock()
 
-	if state.NewContainer == "" {
+	if containerID == "" {
 		return fmt.Errorf("no container for service %q", service)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	hm.activeMonitors[service] = cancel
 
-	go hm.monitorServiceHealth(ctx, service, state.NewContainer)
+	go hm.monitorServiceHealth(ctx, service, containerID)
 
 	hm.log.Info("started health monitoring",
 		zap.String("service", service),
-		zap.String("container_id", state.NewContainer))
+		zap.String("container_id", containerID))
 
 	return nil
 }
@@ -182,7 +186,16 @@ func (hm *HealthMonitor) emitHealthEvent(service string, oldStatus, newStatus He
 
 	// Notify listeners
 	for _, listener := range hm.listeners {
-		go listener(event)
+		go func(l HealthEventListener) {
+			defer func() {
+				if r := recover(); r != nil {
+					hm.log.Error("health event listener panicked",
+						zap.String("service", service),
+						zap.Any("panic", r))
+				}
+			}()
+			l(event)
+		}(listener)
 	}
 
 	hm.log.Info("health event emitted",
@@ -192,8 +205,14 @@ func (hm *HealthMonitor) emitHealthEvent(service string, oldStatus, newStatus He
 }
 
 // updateRolloutStateFromEvent updates the rollout state based on health events.
+//
+// RecordHealthCheckSuccess/Failure and IsCircuitOpen each take rollout.mu
+// themselves, so they must be called here without holding it — only the
+// direct HealthCheckPassed field write is done under an explicit lock.
 func (hm *HealthMonitor) updateRolloutStateFromEvent(event *HealthEvent) {
+	hm.rollout.mu.Lock()
 	state, ok := hm.rollout.state.ServiceStates[event.Service]
+	hm.rollout.mu.Unlock()
 	if !ok {
 		return
 	}
@@ -201,11 +220,18 @@ func (hm *HealthMonitor) updateRolloutStateFromEvent(event *HealthEvent) {
 	switch event.NewStatus {
 	case HealthHealthy:
 		hm.rollout.RecordHealthCheckSuccess(event.Service, hm.config)
+
+		hm.rollout.mu.Lock()
 		state.HealthCheckPassed = true
+		hm.rollout.mu.Unlock()
 
 	case HealthUnhealthy:
 		hm.rollout.RecordHealthCheckFailure(event.Service, hm.config)
+
+		hm.rollout.mu.Lock()
 		state.HealthCheckPassed = false
+		hm.rollout.mu.Unlock()
+
 		event.CircuitOpen = hm.rollout.IsCircuitOpen(event.Service)
 
 	case HealthStarting:

@@ -217,6 +217,13 @@ func (r *Registry) SetDraining(id string) error {
 // (Runtime Constitution §III Layer 5). It only flips between Active and
 // Unhealthy; it never overrides Draining or Failed (owned by the deployment /
 // terminal lifecycle). Unknown backend returns an error.
+//
+// WARNING: unlike SetHealthGuarded, this has NO zero-backend protection — a
+// demotion here can drive a service's active-backend count to zero, dropping
+// all traffic. The live health-check path (health_controller.go) intentionally
+// uses SetHealthGuarded instead. Do not wire automated health-driven demotion
+// through this method; it exists for callers that need an explicit,
+// un-guarded override and understand that risk.
 func (r *Registry) SetHealth(id string, healthy bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

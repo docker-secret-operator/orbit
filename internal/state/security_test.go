@@ -54,3 +54,46 @@ func TestAtomicWriteJSONOverwritePreserves0600(t *testing.T) {
 		t.Errorf("overwritten state file permissions = %o, want 0600", perm)
 	}
 }
+
+// TestAcquireAdvisoryLockProduces0600 pins the same policy for lock files:
+// they live in the same state directory as files that can carry an API
+// token, so a world-readable lock file (the previous 0644) is an
+// inconsistency with the "state files must never be group/world readable"
+// policy even though the lock file itself holds no data.
+func TestAcquireAdvisoryLockProduces0600(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "service.lock")
+
+	lock, err := AcquireAdvisoryLock(lockPath, 0)
+	if err != nil {
+		t.Fatalf("AcquireAdvisoryLock: %v", err)
+	}
+	defer lock.Release() //nolint:errcheck
+
+	fi, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0600 {
+		t.Errorf("lock file permissions = %o, want 0600", perm)
+	}
+}
+
+func TestAcquireAdvisoryReadLockProduces0600(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "service.lock")
+
+	lock, err := AcquireAdvisoryReadLock(lockPath, 0)
+	if err != nil {
+		t.Fatalf("AcquireAdvisoryReadLock: %v", err)
+	}
+	defer lock.Release() //nolint:errcheck
+
+	fi, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0600 {
+		t.Errorf("lock file permissions = %o, want 0600", perm)
+	}
+}

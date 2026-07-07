@@ -624,8 +624,7 @@ Contributing? Start with [docs/governance/CONTRIBUTING.md](docs/governance/CONTR
 
 ```bash
 make build              # ./bin/docker-orbit
-make test               # stable suite, -race, ~30s
-make test-known-issues  # internal/stack, internal/state — known flaky/failing, non-blocking
+make test               # stable suite, -race, ~30s (includes internal/stack, internal/state)
 make test-soak          # chaos + extended-load suites — slow, minutes not seconds
 make docker-build       # orbit/proxy:latest
 make install-plugin     # /usr/local/lib/docker/cli-plugins/docker-orbit

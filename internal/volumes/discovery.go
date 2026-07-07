@@ -21,6 +21,7 @@ type DockerClient interface {
 type VolumeManager struct {
 	docker DockerClient
 	log    *zap.Logger
+	runner commandRunner
 }
 
 // NewVolumeManager creates a new volume manager
@@ -31,6 +32,7 @@ func NewVolumeManager(docker DockerClient, log *zap.Logger) *VolumeManager {
 	return &VolumeManager{
 		docker: docker,
 		log:    log,
+		runner: execCommandRunner{},
 	}
 }
 

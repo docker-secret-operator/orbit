@@ -3,6 +3,7 @@ package benchmark
 import (
 	"fmt"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 )
@@ -49,7 +50,7 @@ func (lr *LatencyRecorder) GetStats() (avg, min, max, p50, p95, p99 time.Duratio
 	// Sort for percentiles
 	sorted := make([]time.Duration, len(lr.latencies))
 	copy(sorted, lr.latencies)
-	quickSort(sorted, 0, len(sorted)-1)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 
 	// Min/Max
 	min = sorted[0]
@@ -110,7 +111,7 @@ func (br *BenchmarkRunner) Stop() *BenchmarkResult {
 	avg, min, max, p50, p95, p99 := br.latencies.GetStats()
 
 	allocDiff := br.endMemStats.Alloc - br.startMemStats.Alloc
-	freeDiff := br.startMemStats.Frees - br.endMemStats.Frees
+	freeDiff := br.endMemStats.Frees - br.startMemStats.Frees
 
 	opsPerSec := float64(br.iterations) / duration.Seconds()
 
@@ -264,24 +265,3 @@ func (ltr *LoadTestResult) String() string {
 	)
 }
 
-// quickSort helper for latency sorting
-func quickSort(arr []time.Duration, low, high int) {
-	if low < high {
-		p := partition(arr, low, high)
-		quickSort(arr, low, p-1)
-		quickSort(arr, p+1, high)
-	}
-}
-
-func partition(arr []time.Duration, low, high int) int {
-	pivot := arr[high]
-	i := low - 1
-	for j := low; j < high; j++ {
-		if arr[j] < pivot {
-			i++
-			arr[i], arr[j] = arr[j], arr[i]
-		}
-	}
-	arr[i+1], arr[high] = arr[high], arr[i+1]
-	return i + 1
-}

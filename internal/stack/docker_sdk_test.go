@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/go-connections/nat"
 	"go.uber.org/zap"
 )
 
@@ -40,6 +41,35 @@ func TestDockerSDKHelperFunctions(t *testing.T) {
 	if len(bindings) != 2 {
 		t.Fatalf("expected 2 port bindings, got %d", len(bindings))
 	}
+}
+
+// TestPortMapToPortBindings_HostPortMapsToContainerPort verifies the
+// documented "host port -> container port" convention (RunOptions.Ports,
+// ContainerInfo.Ports doc comments): the map KEY is the host port, the VALUE
+// is the container port that should be exposed under it.
+func TestPortMapToPortBindings_HostPortMapsToContainerPort(t *testing.T) {
+	ports := map[int]int{
+		8080: 3000, // host 8080 -> container 3000
+	}
+
+	bindings := portMapToPortBindings(ports)
+
+	containerPortKey := nat.Port("3000/tcp")
+	binds, ok := bindings[containerPortKey]
+	if !ok {
+		t.Fatalf("expected a binding keyed by container port 3000/tcp, got keys: %v", bindingKeys(bindings))
+	}
+	if len(binds) != 1 || binds[0].HostPort != "8080" {
+		t.Fatalf("expected container port 3000 to be bound to host port 8080, got %+v", binds)
+	}
+}
+
+func bindingKeys(bindings nat.PortMap) []nat.Port {
+	keys := make([]nat.Port, 0, len(bindings))
+	for k := range bindings {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func TestTransactionBasicFlow(t *testing.T) {
@@ -268,12 +298,18 @@ func TestTransactionFullRollout(t *testing.T) {
 		t.Fatalf("expected 6 operations, got %d", len(txn.operations))
 	}
 
-	// Set up health check to succeed
+	// Set up health check to succeed. Reads sr's state under sr.mu and
+	// writes the mock's health map via SetContainerHealth (both properly
+	// synchronized) since txn.Execute() below reads/writes the same state
+	// and health map concurrently with this goroutine.
 	go func() {
 		for {
 			time.Sleep(100 * time.Millisecond)
-			if containerID := sr.state.ServiceStates["api"].NewContainer; containerID != "" {
-				mockClient.ContainerHealthStates[containerID] = HealthHealthy
+			sr.mu.Lock()
+			containerID := sr.state.ServiceStates["api"].NewContainer
+			sr.mu.Unlock()
+			if containerID != "" {
+				mockClient.SetContainerHealth(containerID, HealthHealthy)
 				break
 			}
 		}

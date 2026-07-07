@@ -3,6 +3,7 @@ package benchmark
 import (
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -156,12 +157,11 @@ func computePercentile(latencies []int64, p float64) int64 {
 		idx = len(latencies) - 1
 	}
 
-	// Quick sort for simplicity (real implementation would use better sort)
 	sorted := make([]time.Duration, len(latencies))
 	for i, v := range latencies {
 		sorted[i] = time.Duration(v)
 	}
-	quickSort(sorted, 0, len(sorted)-1)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 
 	return int64(sorted[idx])
 }
@@ -275,6 +275,9 @@ func (elt *ExtendedLoadTest) analyzeResults() {
 
 // TestExtendedLoadBaseline runs 50 services for 60 seconds
 func TestExtendedLoadBaseline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 60s extended load test in short mode")
+	}
 	// Quick 60-second test instead of 3600-second test
 	elt := NewExtendedLoadTest(50)
 	elt.RunScenario(
@@ -287,6 +290,9 @@ func TestExtendedLoadBaseline(t *testing.T) {
 
 // TestExtendedLoadPeakSpike runs 50 services with 3x traffic spike
 func TestExtendedLoadPeakSpike(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 60s extended load test in short mode")
+	}
 	elt := NewExtendedLoadTest(50)
 	elt.RunScenario(
 		"Peak Load Spike (50 services, 60s spike)",
@@ -298,6 +304,9 @@ func TestExtendedLoadPeakSpike(t *testing.T) {
 
 // TestExtendedLoadChaos runs 50 services with random errors
 func TestExtendedLoadChaos(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 60s extended load test in short mode")
+	}
 	elt := NewExtendedLoadTest(50)
 
 	// Start chaos events
@@ -320,6 +329,9 @@ func TestExtendedLoadChaos(t *testing.T) {
 
 // TestExtendedLoadSmallCluster runs 10 services for sustained period
 func TestExtendedLoadSmallCluster(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 60s extended load test in short mode")
+	}
 	elt := NewExtendedLoadTest(10)
 	elt.RunScenario(
 		"Small Cluster (10 services, 60s)",
@@ -331,6 +343,9 @@ func TestExtendedLoadSmallCluster(t *testing.T) {
 
 // TestExtendedLoadMediumCluster runs 25 services
 func TestExtendedLoadMediumCluster(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 60s extended load test in short mode")
+	}
 	elt := NewExtendedLoadTest(25)
 	elt.RunScenario(
 		"Medium Cluster (25 services, 60s)",

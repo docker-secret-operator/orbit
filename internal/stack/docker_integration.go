@@ -41,22 +41,26 @@ func (di *DockerIntegration) EnsureContainersRunning(services []string) error {
 
 // ensureServiceRunning ensures a single service has a running container.
 func (di *DockerIntegration) ensureServiceRunning(service string) error {
+	di.rollout.mu.Lock()
 	state, ok := di.rollout.state.ServiceStates[service]
 	if !ok {
+		di.rollout.mu.Unlock()
 		return fmt.Errorf("service %q not found in rollout state", service)
 	}
+	existingContainer := state.NewContainer
+	di.rollout.mu.Unlock()
 
 	// If container already exists and is running, verify health
-	if state.NewContainer != "" {
-		info, err := di.client.InspectContainer(state.NewContainer)
+	if existingContainer != "" {
+		info, err := di.client.InspectContainer(existingContainer)
 		if err != nil {
 			di.log.Warn("failed to inspect container",
 				zap.String("service", service),
-				zap.String("container_id", state.NewContainer))
+				zap.String("container_id", existingContainer))
 		} else if info.Status == ContainerRunning {
 			di.log.Debug("container already running",
 				zap.String("service", service),
-				zap.String("container_id", state.NewContainer))
+				zap.String("container_id", existingContainer))
 			return nil
 		}
 	}
@@ -71,11 +75,19 @@ func (di *DockerIntegration) ensureServiceRunning(service string) error {
 	}
 
 	if err := di.client.StartContainer(containerID); err != nil {
-		di.client.RemoveContainer(containerID, true)
+		if cleanupErr := di.client.RemoveContainer(containerID, true); cleanupErr != nil {
+			di.log.Warn("cleanup of container that failed to start also failed; container may be leaked",
+				zap.String("service", service),
+				zap.String("container_id", containerID),
+				zap.Error(cleanupErr))
+		}
 		return fmt.Errorf("failed to start container: %w", err)
 	}
 
+	di.rollout.mu.Lock()
 	state.NewContainer = containerID
+	di.rollout.mu.Unlock()
+
 	di.log.Info("service container started",
 		zap.String("service", service),
 		zap.String("container_id", containerID))
@@ -85,12 +97,16 @@ func (di *DockerIntegration) ensureServiceRunning(service string) error {
 
 // MonitorContainerHealth monitors a container's health until timeout or completion.
 func (di *DockerIntegration) MonitorContainerHealth(service string, timeout time.Duration) error {
+	di.rollout.mu.Lock()
 	state, ok := di.rollout.state.ServiceStates[service]
 	if !ok {
+		di.rollout.mu.Unlock()
 		return fmt.Errorf("service %q not found", service)
 	}
+	containerID := state.NewContainer
+	di.rollout.mu.Unlock()
 
-	if state.NewContainer == "" {
+	if containerID == "" {
 		return fmt.Errorf("no container for service %q", service)
 	}
 
@@ -102,7 +118,7 @@ func (di *DockerIntegration) MonitorContainerHealth(service string, timeout time
 			return fmt.Errorf("health check timeout for service %q", service)
 		}
 
-		health, err := di.client.GetContainerHealth(state.NewContainer)
+		health, err := di.client.GetContainerHealth(containerID)
 		if err != nil {
 			di.log.Warn("failed to check container health",
 				zap.String("service", service),
@@ -137,27 +153,31 @@ func (di *DockerIntegration) MonitorContainerHealth(service string, timeout time
 
 // DrainConnections waits for existing connections to finish.
 func (di *DockerIntegration) DrainConnections(service string, timeout time.Duration) error {
+	di.rollout.mu.Lock()
 	state, ok := di.rollout.state.ServiceStates[service]
 	if !ok {
+		di.rollout.mu.Unlock()
 		return fmt.Errorf("service %q not found", service)
 	}
+	oldContainer := state.OldContainer
+	di.rollout.mu.Unlock()
 
-	if state.OldContainer == "" {
+	if oldContainer == "" {
 		return nil // No old container to drain
 	}
 
 	di.log.Info("draining connections",
 		zap.String("service", service),
 		zap.Duration("timeout", timeout),
-		zap.String("container_id", state.OldContainer))
+		zap.String("container_id", oldContainer))
 
 	// Wait for container to stop or timeout
-	exitCode, err := di.client.WaitForContainer(state.OldContainer, timeout)
+	exitCode, err := di.client.WaitForContainer(oldContainer, timeout)
 	if err != nil {
 		di.log.Warn("connection drain timeout, forcing stop",
 			zap.String("service", service),
 			zap.Error(err))
-		return di.client.StopContainer(state.OldContainer, 5*time.Second)
+		return di.client.StopContainer(oldContainer, 5*time.Second)
 	}
 
 	di.log.Info("connections drained",
@@ -169,50 +189,64 @@ func (di *DockerIntegration) DrainConnections(service string, timeout time.Durat
 
 // SwitchTraffic atomically switches traffic from old container to new one.
 func (di *DockerIntegration) SwitchTraffic(service string) error {
+	di.rollout.mu.Lock()
 	state, ok := di.rollout.state.ServiceStates[service]
 	if !ok {
+		di.rollout.mu.Unlock()
 		return fmt.Errorf("service %q not found", service)
 	}
 
 	if state.NewContainer == "" {
+		di.rollout.mu.Unlock()
 		return fmt.Errorf("no new container for service %q", service)
 	}
 
-	di.log.Info("switching traffic",
-		zap.String("service", service),
-		zap.String("old_container", state.OldContainer),
-		zap.String("new_container", state.NewContainer))
+	oldContainer := state.OldContainer
+	newContainer := state.NewContainer
 
 	// In a real implementation, this would update load balancer or proxy
 	// For now, we just mark the transition
 	state.Status = StatusCompleted
+	di.rollout.mu.Unlock()
+
+	di.log.Info("switching traffic",
+		zap.String("service", service),
+		zap.String("old_container", oldContainer),
+		zap.String("new_container", newContainer))
 
 	return nil
 }
 
 // CleanupOldContainer removes the old container after rollout.
 func (di *DockerIntegration) CleanupOldContainer(service string) error {
+	di.rollout.mu.Lock()
 	state, ok := di.rollout.state.ServiceStates[service]
 	if !ok {
+		di.rollout.mu.Unlock()
 		return fmt.Errorf("service %q not found", service)
 	}
+	oldContainer := state.OldContainer
+	di.rollout.mu.Unlock()
 
-	if state.OldContainer == "" {
+	if oldContainer == "" {
 		return nil // No old container to cleanup
 	}
 
 	di.log.Debug("cleaning up old container",
 		zap.String("service", service),
-		zap.String("container_id", state.OldContainer))
+		zap.String("container_id", oldContainer))
 
-	if err := di.client.RemoveContainer(state.OldContainer, true); err != nil {
+	if err := di.client.RemoveContainer(oldContainer, true); err != nil {
 		di.log.Warn("failed to remove old container",
 			zap.String("service", service),
 			zap.Error(err))
 		return err
 	}
 
+	di.rollout.mu.Lock()
 	state.OldContainer = ""
+	di.rollout.mu.Unlock()
+
 	di.log.Info("old container removed",
 		zap.String("service", service))
 
@@ -221,17 +255,19 @@ func (di *DockerIntegration) CleanupOldContainer(service string) error {
 
 // RolloutService performs a complete zero-downtime rollout of a service.
 func (di *DockerIntegration) RolloutService(service string, timeout time.Duration) error {
+	di.rollout.mu.Lock()
 	state, ok := di.rollout.state.ServiceStates[service]
 	if !ok {
+		di.rollout.mu.Unlock()
 		return fmt.Errorf("service %q not found", service)
 	}
+	state.Status = StatusRolling
+	state.StartedAt = time.Now()
+	di.rollout.mu.Unlock()
 
 	di.log.Info("starting service rollout",
 		zap.String("service", service),
 		zap.Duration("timeout", timeout))
-
-	state.Status = StatusRolling
-	state.StartedAt = time.Now()
 
 	// Step 1: Start new container
 	if err := di.ensureServiceRunning(service); err != nil {
@@ -240,16 +276,25 @@ func (di *DockerIntegration) RolloutService(service string, timeout time.Duratio
 	}
 
 	// Step 2: Wait for health check
+	di.rollout.mu.Lock()
 	state.Status = StatusHealthCheck
+	di.rollout.mu.Unlock()
+
 	if err := di.MonitorContainerHealth(service, timeout); err != nil {
 		di.rollout.UpdateServiceStatus(service, StatusFailed, err)
-		di.client.RemoveContainer(state.NewContainer, true)
+
+		di.rollout.mu.Lock()
+		failedContainer := state.NewContainer
 		state.NewContainer = ""
+		di.rollout.mu.Unlock()
+
+		di.client.RemoveContainer(failedContainer, true)
 		return err
 	}
 
-	// Step 3: Switch traffic
-	state.OldContainer = state.NewContainer // Move new to old for cleanup
+	// Step 3: Switch traffic. state.OldContainer already holds the
+	// previously-active container that should be retired; state.NewContainer
+	// is the container that just passed its health check and takes over.
 	if err := di.SwitchTraffic(service); err != nil {
 		di.rollout.UpdateServiceStatus(service, StatusFailed, err)
 		return err
@@ -270,17 +315,24 @@ func (di *DockerIntegration) RolloutService(service string, timeout time.Duratio
 
 	// Mark complete
 	di.rollout.UpdateServiceStatus(service, StatusCompleted, nil)
+
+	di.rollout.mu.Lock()
 	state.CompletedAt = time.Now()
+	startedAt := state.StartedAt
+	di.rollout.mu.Unlock()
 
 	di.log.Info("service rollout completed",
 		zap.String("service", service),
-		zap.Duration("duration", time.Since(state.StartedAt)))
+		zap.Duration("duration", time.Since(startedAt)))
 
 	return nil
 }
 
 // getServiceImage returns the image for a service from dependency graph.
 func (di *DockerIntegration) getServiceImage(service string) string {
+	di.rollout.mu.Lock()
+	defer di.rollout.mu.Unlock()
+
 	if di.rollout.state.Graph == nil {
 		return service + ":latest"
 	}

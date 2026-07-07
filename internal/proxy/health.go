@@ -192,8 +192,11 @@ func (hv *HealthValidator) BatchCheck(ctx context.Context, containers map[string
 	return results
 }
 
-// Close releases resources.
+// Close releases resources. It does not close the semaphore channel: an
+// in-flight CheckHealth call can still be blocked trying to acquire it (this
+// method races with BatchCheck goroutines during shutdown), and sending on a
+// closed channel panics. The channel needs no explicit close — it's garbage
+// collected like any other value once nothing references it.
 func (hv *HealthValidator) Close() error {
-	close(hv.semaphore)
 	return nil
 }

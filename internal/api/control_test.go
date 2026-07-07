@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	rolloutapi "github.com/docker-secret-operator/orbit/internal/api"
@@ -184,6 +185,52 @@ func TestAPI_AddBackend_InvalidJSON(t *testing.T) {
 	resp, _ := http.Post(ts.URL+"/backends", "application/json", bytes.NewBufferString("{bad json}"))
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("invalid json: want 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestAPI_AddBackend_MalformedAddr_Returns400(t *testing.T) {
+	_, ts := newTestAPI(t)
+	payload := `{"id":"b1","addr":"not-a-host-port"}`
+	resp, _ := http.Post(ts.URL+"/backends", "application/json", bytes.NewBufferString(payload))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("malformed addr: want 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestAPI_AddBackend_IDWithControlCharacters_Returns400(t *testing.T) {
+	_, ts := newTestAPI(t)
+	payload := `{"id":"b1\nSet-Cookie: evil=true","addr":"10.0.0.1:8080"}`
+	resp, _ := http.Post(ts.URL+"/backends", "application/json", bytes.NewBufferString(payload))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("id with control characters: want 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestAPI_AddBackend_IDTooLong_Returns400(t *testing.T) {
+	_, ts := newTestAPI(t)
+	longID := strings.Repeat("a", 300)
+	payload := `{"id":"` + longID + `","addr":"10.0.0.1:8080"}`
+	resp, _ := http.Post(ts.URL+"/backends", "application/json", bytes.NewBufferString(payload))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("id too long: want 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestAPI_AddBackend_OversizedBody_Rejected(t *testing.T) {
+	_, ts := newTestAPI(t)
+
+	// Pad the JSON body with a huge amount of harmless whitespace before the
+	// closing brace so the request is well past any reasonable control-API
+	// payload size while still being (if fully read) valid JSON.
+	padding := strings.Repeat(" ", 5<<20) // 5MB of padding
+	payload := `{"id":"b1","addr":"10.0.0.1:8080"` + padding + `}`
+
+	resp, err := http.Post(ts.URL+"/backends", "application/json", bytes.NewBufferString(payload))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	if resp.StatusCode == http.StatusCreated {
+		t.Fatalf("oversized body: expected rejection, got 201 Created")
 	}
 }
 

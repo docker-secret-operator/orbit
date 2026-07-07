@@ -100,9 +100,7 @@ func (cs *ControlServer) ListenAndServe(addr string) error {
 	cs.ln = ln
 	cs.log.Info("control API listening", zap.String("addr", addr))
 
-	// Wrap mux with security middleware.
-	handler := cs.middleware(cs.mux)
-	return http.Serve(ln, handler) //nolint:wrapcheck
+	return http.Serve(ln, cs.Handler()) //nolint:wrapcheck
 }
 
 // Close shuts down the HTTP listener and rate limiter.
@@ -114,8 +112,11 @@ func (cs *ControlServer) Close() error {
 	return nil
 }
 
-// Handler returns the underlying http.Handler for use with httptest.NewServer.
-func (cs *ControlServer) Handler() http.Handler { return cs.mux }
+// Handler returns the http.Handler for use with httptest.NewServer or
+// http.Serve — this includes the security middleware (rate limiting, request
+// body size limit), not just the bare route mux, so tests built on this
+// exercise the same protections production traffic goes through.
+func (cs *ControlServer) Handler() http.Handler { return cs.middleware(cs.mux) }
 
 // ── Route registration ────────────────────────────────────────────────────────
 
@@ -355,6 +356,25 @@ func (cs *ControlServer) listBackends(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// maxBackendIDLen bounds backend IDs, which flow into Prometheus metric
+// labels and JSON status responses — unbounded input lets a caller bloat
+// both.
+const maxBackendIDLen = 253
+
+// validateBackendID rejects backend IDs that could corrupt logs/metrics
+// output (control characters, e.g. newlines) or that are unreasonably long.
+func validateBackendID(id string) error {
+	if len(id) > maxBackendIDLen {
+		return fmt.Errorf("id exceeds maximum length of %d characters", maxBackendIDLen)
+	}
+	for _, r := range id {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("id must not contain control characters")
+		}
+	}
+	return nil
+}
+
 func (cs *ControlServer) addBackend(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID   string `json:"id"`
@@ -368,8 +388,16 @@ func (cs *ControlServer) addBackend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "addr is required", "missing_field")
 		return
 	}
+	if _, _, err := net.SplitHostPort(req.Addr); err != nil {
+		writeErr(w, http.StatusBadRequest, "addr must be a valid host:port: "+err.Error(), "invalid_field")
+		return
+	}
 	if req.ID == "" {
 		req.ID = req.Addr
+	}
+	if err := validateBackendID(req.ID); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error(), "invalid_field")
+		return
 	}
 
 	b := proxy.Backend{ID: req.ID, Addr: req.Addr}
@@ -420,8 +448,16 @@ func (cs *ControlServer) removeBackend(w http.ResponseWriter, id string) {
 // ── Security middleware ───────────────────────────────────────────────────────
 
 // middleware wraps handler with rate limiting and audit logging.
+// maxRequestBodyBytes bounds request bodies for every control-API handler.
+// The largest legitimate payload (POST /backends) is a handful of short
+// fields; 1MB is generous headroom while still preventing an unbounded body
+// from exhausting memory.
+const maxRequestBodyBytes = 1 << 20 // 1MB
+
 func (cs *ControlServer) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+
 		// Rate limiting.
 		ip := clientIP(r)
 		if !cs.rateLimiter.Allow(ip) {

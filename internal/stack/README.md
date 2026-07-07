@@ -21,9 +21,13 @@ nothing else in the codebase provides. See:
 
 Orbit v1 is deliberately scoped to **single-service** deployments
 (`internal/rollout`). This package was added in the 2026-07-02 "Phase 5" merge
-but was never wired to the CLI and has known data races. It was fenced into the
-non-blocking test tier (`make test-known-issues`) so it cannot destabilize the
-v1 release. This is intentional isolation, not an accident.
+and was never wired to the CLI (still true: `internal/stack` has zero
+importers outside itself — verify with `grep -rln 'internal/stack"'
+../../cmd/ ..`). It previously also had known data races and was fenced into
+a non-blocking test tier for that reason; those races are now fixed and the
+package runs in the normal blocking test gate (`make test`), but it remains
+architecturally isolated from v1 — this is about test-gate participation,
+not production wiring. This isolation is intentional, not an accident.
 
 ## The one rule for future contributors
 
