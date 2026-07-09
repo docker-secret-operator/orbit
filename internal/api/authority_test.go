@@ -27,8 +27,15 @@ func newAuthorityTestAPI(t *testing.T) (*state.StateManager, *httptest.Server) {
 	srv := proxy.NewServer(zap.NewNop(), m)
 	t.Cleanup(srv.Close)
 
+	// SetDebugHandler below sets cs.service to "web", overriding whatever is
+	// passed to NewControlServer here — the ProjectRegistry must register
+	// reg under "web" (not testService) so resolveRegistry("web") still
+	// finds it.
+	pr := proxy.NewProjectRegistry()
+	pr.Register("web", reg)
+
 	sm := state.NewStateManager(t.TempDir(), zap.NewNop())
-	cs := rolloutapi.NewControlServer(reg, srv, zap.NewNop(), m, "", sm)
+	cs := rolloutapi.NewControlServer(pr, "web", srv, zap.NewNop(), m, "", sm)
 	cs.SetDebugHandler(rolloutapi.NewDebugHandler(sm, metrics.NewMetricsCollector()), "web", "test")
 	ts := httptest.NewServer(cs.Handler())
 	t.Cleanup(ts.Close)
@@ -152,7 +159,10 @@ func TestAuthorityEndpoints_NilStateManagerIsNoop(t *testing.T) {
 	srv := proxy.NewServer(zap.NewNop(), m)
 	t.Cleanup(srv.Close)
 
-	cs := rolloutapi.NewControlServer(reg, srv, zap.NewNop(), m, "", nil)
+	pr := proxy.NewProjectRegistry()
+	pr.Register(testService, reg)
+
+	cs := rolloutapi.NewControlServer(pr, testService, srv, zap.NewNop(), m, "", nil)
 	ts := httptest.NewServer(cs.Handler())
 	t.Cleanup(ts.Close)
 

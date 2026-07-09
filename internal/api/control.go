@@ -27,44 +27,54 @@ import (
 
 // ControlServer exposes the Orbit backend management API over HTTP.
 type ControlServer struct {
-	reg            *proxy.Registry
-	srv            *proxy.Server
-	log            *zap.Logger
-	metrics        *metrics.Proxy
-	startTime      time.Time
-	token          string // empty → unauthenticated (warning at startup)
-	rateLimiter    *RateLimiter
-	ln             net.Listener
-	mux            *http.ServeMux
-	startupState   proxy.StartupState // Current startup state
-	startupStateMu sync.RWMutex       // Protects startupState
-	debug          *DebugHandler      // Nil until SetDebugHandler is called.
-	service        string             // Proxy instance identifier, for StatusReport.
-	version        string             // Runtime version, for StatusReport.
+	projectRegistry   *proxy.ProjectRegistry // ADR-0006 Stage 3.2 — see resolveRegistry
+	srv               *proxy.Server
+	log               *zap.Logger
+	metrics           *metrics.Proxy
+	startTime         time.Time
+	token             string // empty → unauthenticated (warning at startup)
+	rateLimiter       *RateLimiter
+	ln                net.Listener
+	mux               *http.ServeMux
+	startupState      proxy.StartupState  // Current startup state
+	startupStateMu    sync.RWMutex        // Protects startupState
+	debug             *DebugHandler       // Nil until SetDebugHandler is called.
+	service           string              // Proxy instance identifier, for StatusReport.
+	version           string              // Runtime version, for StatusReport.
 	sm                *state.StateManager // Authority persistence — see AUTHORITY-LIFECYCLE.md. Nil-safe: a nil sm makes the /authority/* handlers no-ops (used by tests that don't care about persistence).
 	transitionTimeout time.Duration       // Set via SetTransitionTimeout; defaults to 5m, matching config.ProxyConfig's default.
 	recoveryState                         // POST /recover trigger + in-flight guard (recovery.go)
 }
 
-// NewControlServer creates a control server backed by reg, srv, and m.
+// NewControlServer creates a control server backed by pr, srv, and m.
 // apiToken provides optional bearer token authentication. sm may be nil —
 // see the ControlServer.sm field doc.
-func NewControlServer(reg *proxy.Registry, srv *proxy.Server, log *zap.Logger, m *metrics.Proxy, apiToken string, sm *state.StateManager) *ControlServer {
+//
+// service is the name ControlServer resolves through pr for every existing
+// (unscoped) route — ADR-0006 Stage 3.2 makes ControlServer aware that
+// backends live inside a ProjectRegistry rather than a single bare
+// *proxy.Registry, but does not add URL-based service scoping yet (later
+// Stage 3 work); every handler today still serves exactly one service,
+// this one, resolved once per request via resolveRegistry. Set here rather
+// than left to default until SetDebugHandler runs, so cs.service is never
+// the zero value at request time.
+func NewControlServer(pr *proxy.ProjectRegistry, service string, srv *proxy.Server, log *zap.Logger, m *metrics.Proxy, apiToken string, sm *state.StateManager) *ControlServer {
 	if apiToken == "" {
 		log.Warn("control API: unauthenticated (set ORBIT_API_TOKEN to secure)")
 	}
 
 	cs := &ControlServer{
-		reg:          reg,
-		srv:          srv,
-		log:          log,
-		metrics:      m,
-		startTime:    time.Now(),
-		token:        apiToken,
-		rateLimiter:  NewRateLimiter(100),
-		mux:          http.NewServeMux(),
-		startupState: proxy.StartupReady, // Caller overrides during actual proxy startup
-		sm:           sm,
+		projectRegistry:   pr,
+		service:           service,
+		srv:               srv,
+		log:               log,
+		metrics:           m,
+		startTime:         time.Now(),
+		token:             apiToken,
+		rateLimiter:       NewRateLimiter(100),
+		mux:               http.NewServeMux(),
+		startupState:      proxy.StartupReady, // Caller overrides during actual proxy startup
+		sm:                sm,
 		transitionTimeout: 5 * time.Minute,
 	}
 	cs.registerRoutes()
@@ -163,6 +173,39 @@ func (cs *ControlServer) registerRoutes() {
 	cs.mux.HandleFunc("/authority/commit", cs.auth(cs.handleAuthorityCommit))
 }
 
+// ── Service resolution (ADR-0006 Stage 3.2) ────────────────────────────────────
+
+// resolveRegistry is the single choke point every handler uses to turn a
+// service name into the *proxy.Registry that owns its backends, replacing
+// what was a bare cs.reg field before this stage. Centralizing this here —
+// rather than each handler calling cs.projectRegistry.For directly — is
+// deliberate: the Stage 3 dependency audit found ten-plus direct cs.reg
+// call sites, and every one of them needs the identical unknown-service
+// response if resolution ever fails, not ten slightly different ones.
+//
+// On success returns the resolved Registry and true. On failure it has
+// already written the HTTP error response itself (a consistent 503 —
+// service_unavailable, not not_found, since an unresolvable service name
+// here means "this proxy isn't configured for that service" rather than
+// "that service used to exist and doesn't now") and returns (nil, false);
+// callers must return immediately without touching w again.
+//
+// Every call site today passes cs.service — there is no per-request
+// service dimension yet, since URL-based scoping (/services/{service}/...)
+// is later Stage 3 work, not this one. The service parameter exists now so
+// that later work only has to change what's passed in, not add a resolution
+// step that doesn't exist yet.
+func (cs *ControlServer) resolveRegistry(w http.ResponseWriter, service string) (*proxy.Registry, bool) {
+	reg, ok := cs.projectRegistry.For(service)
+	if !ok {
+		writeErr(w, http.StatusServiceUnavailable,
+			fmt.Sprintf("no registry configured for service %q", service),
+			"service_unavailable")
+		return nil, false
+	}
+	return reg, true
+}
+
 // GET /status — consolidated deployment/proxy/recovery status. Backing for
 // `docker orbit status`. See StatusReport and BuildStatusReport for what
 // this actually computes and why.
@@ -171,7 +214,11 @@ func (cs *ControlServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, r.Method, "GET")
 		return
 	}
-	report := BuildStatusReport(r.Context(), cs.service, cs.version, cs.GetStartupState(), cs.reg, cs.debug)
+	reg, ok := cs.resolveRegistry(w, cs.service)
+	if !ok {
+		return
+	}
+	report := BuildStatusReport(r.Context(), cs.service, cs.version, cs.GetStartupState(), reg, cs.debug)
 	writeJSON(w, http.StatusOK, report)
 }
 
@@ -183,9 +230,13 @@ func (cs *ControlServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, r.Method, "GET")
 		return
 	}
+	reg, ok := cs.resolveRegistry(w, cs.service)
+	if !ok {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":   "ok",
-		"backends": cs.reg.Len(),
+		"backends": reg.Len(),
 	})
 }
 
@@ -214,8 +265,12 @@ func (cs *ControlServer) handleReady(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	reg, ok := cs.resolveRegistry(w, cs.service)
+	if !ok {
+		return
+	}
 	state := cs.GetStartupState()
-	active := cs.reg.Active()
+	active := reg.Active()
 
 	// CRITICAL: Respect startup state, not just backend count.
 	// Failed/Recovering states are not ready, even if backends exist.
@@ -291,8 +346,12 @@ func (cs *ControlServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, r.Method, "GET")
 		return
 	}
-	all := cs.reg.Backends()
-	active := cs.reg.Active()
+	reg, ok := cs.resolveRegistry(w, cs.service)
+	if !ok {
+		return
+	}
+	all := reg.Backends()
+	active := reg.Active()
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	cs.metrics.WritePrometheus(w, len(all), len(active))
@@ -352,7 +411,11 @@ func (cs *ControlServer) handleBackendByID(w http.ResponseWriter, r *http.Reques
 // ── Individual actions ────────────────────────────────────────────────────────
 
 func (cs *ControlServer) listBackends(w http.ResponseWriter, _ *http.Request) {
-	all := cs.reg.Backends()
+	reg, ok := cs.resolveRegistry(w, cs.service)
+	if !ok {
+		return
+	}
+	all := reg.Backends()
 	type row struct {
 		ID       string `json:"id"`
 		Addr     string `json:"addr"`
@@ -396,6 +459,11 @@ func validateBackendID(id string) error {
 }
 
 func (cs *ControlServer) addBackend(w http.ResponseWriter, r *http.Request) {
+	reg, ok := cs.resolveRegistry(w, cs.service)
+	if !ok {
+		return
+	}
+
 	var req struct {
 		ID   string `json:"id"`
 		Addr string `json:"addr"`
@@ -421,7 +489,7 @@ func (cs *ControlServer) addBackend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	b := proxy.Backend{ID: req.ID, Addr: req.Addr}
-	if err := cs.reg.Add(b); err != nil {
+	if err := reg.Add(b); err != nil {
 		code := http.StatusInternalServerError
 		errCode := "internal_error"
 		if strings.Contains(err.Error(), "already registered") {
@@ -433,12 +501,16 @@ func (cs *ControlServer) addBackend(w http.ResponseWriter, r *http.Request) {
 	}
 	cs.log.Info("backend registered", zap.String("id", req.ID), zap.String("addr", req.Addr))
 
-	registered, _ := cs.reg.Get(req.ID)
+	registered, _ := reg.Get(req.ID)
 	writeJSON(w, http.StatusCreated, registered)
 }
 
 func (cs *ControlServer) drainBackend(w http.ResponseWriter, id string) {
-	if err := cs.reg.SetDraining(id); err != nil {
+	reg, ok := cs.resolveRegistry(w, cs.service)
+	if !ok {
+		return
+	}
+	if err := reg.SetDraining(id); err != nil {
 		code := http.StatusNotFound
 		if !strings.Contains(err.Error(), "not found") {
 			code = http.StatusInternalServerError
@@ -451,9 +523,13 @@ func (cs *ControlServer) drainBackend(w http.ResponseWriter, id string) {
 }
 
 func (cs *ControlServer) removeBackend(w http.ResponseWriter, id string) {
-	_ = cs.reg.SetDraining(id) // best-effort pre-drain
+	reg, ok := cs.resolveRegistry(w, cs.service)
+	if !ok {
+		return
+	}
+	_ = reg.SetDraining(id) // best-effort pre-drain
 
-	if err := cs.reg.Remove(id); err != nil {
+	if err := reg.Remove(id); err != nil {
 		code := http.StatusNotFound
 		if !strings.Contains(err.Error(), "not found") {
 			code = http.StatusInternalServerError

@@ -302,15 +302,12 @@ func runProxy(log *zap.Logger, version string) error {
 	router.SetMetrics(m)
 	srv := proxy.NewServer(log, m)
 
-	// ADR-0006 Stage 3.1: make a ProjectRegistry exist in the running
-	// process, registering today's one Registry under cfg.ProxyInstance.
-	// Dependency injection only — nothing below this line consumes pr yet.
-	// reg remains what every existing call site in this function uses;
-	// pr is a second, passive reference to the exact same *Registry, not a
-	// second registry. Consuming it (starting with ControlServer) is
-	// Stage 3.2's job, not this one's.
+	// ADR-0006 Stage 3.1: a ProjectRegistry exists in the running process,
+	// registering today's one Registry under cfg.ProxyInstance. reg remains
+	// what every other call site in this function uses directly; pr is a
+	// second, passive reference to the exact same *Registry, not a second
+	// registry. Stage 3.2 makes ControlServer its first consumer, below.
 	pr := newProjectRegistryForService(cfg.ProxyInstance, reg)
-	_ = pr // not consumed yet — see Stage 3.2
 
 	// Bind ports.
 	for _, binding := range cfg.Binds {
@@ -324,7 +321,7 @@ func runProxy(log *zap.Logger, version string) error {
 	sm := state.NewStateManager(cfg.StateDir, log)
 
 	// Start control API with security.
-	controlSrv := api.NewControlServer(reg, srv, log, m, cfg.APIToken, sm)
+	controlSrv := api.NewControlServer(pr, cfg.ProxyInstance, srv, log, m, cfg.APIToken, sm)
 	controlSrv.SetTransitionTimeout(cfg.TransitionTimeout)
 
 	// Wire the debug/status data source (internal/metrics.MetricsCollector,
