@@ -459,9 +459,26 @@ func executeRecovery(
 	debugHandler.RecordActiveGenState(activeGenState)
 	debugHandler.RecordRolloutState(rolloutState)
 
-	// Discover backends and build inventory snapshot.
-	source, err := proxy.NewDockerRecoverySourceWithConfig(
-		cfg.ProxyInstance, log, cfg.TCPDialTimeout, 10)
+	// Discover backends and build inventory snapshot. One retry budget
+	// (bounded to cfg.StartupTimeout, not the caller's ctx — the on-demand
+	// `docker orbit recover` path hits this via a bare HTTP request context
+	// with no deadline of its own) covers both connecting to the daemon and
+	// the discovery/health pass below, so a daemon that's transiently
+	// restarting gets the same chance to recover as a slow-starting backend.
+	retryCtx, retryCancel := context.WithTimeout(ctx, cfg.StartupTimeout)
+	defer retryCancel()
+
+	var source *proxy.DockerRecoverySource
+	source, err = proxy.NewDockerRecoverySourceWithConfig(cfg.ProxyInstance, log, cfg.TCPDialTimeout, 10)
+	for err != nil && retryCtx.Err() == nil {
+		log.Warn("recovery: docker daemon unreachable, retrying within startup budget",
+			zap.Error(err))
+		select {
+		case <-time.After(time.Second):
+		case <-retryCtx.Done():
+		}
+		source, err = proxy.NewDockerRecoverySourceWithConfig(cfg.ProxyInstance, log, cfg.TCPDialTimeout, 10)
+	}
 	if err != nil {
 		log.Warn("recovery: docker unavailable, generating degraded plan",
 			zap.Error(err))
@@ -477,12 +494,7 @@ func executeRecovery(
 		// nothing else ever retries. A backend with its own Docker
 		// HEALTHCHECK reports "starting" instead (StartupRecovering, e.g.
 		// cadvisor) but is just as unregistered until it flips to healthy.
-		// Retry both cases with a bound of our own: at proxy startup ctx
-		// already carries the StartupTimeout deadline, but the on-demand
-		// `docker orbit recover` path hits this via the HTTP request's
-		// context, which has no deadline at all — an indefinitely unhealthy
-		// backend would otherwise retry forever.
-		retryCtx, retryCancel := context.WithTimeout(ctx, cfg.StartupTimeout)
+		// Retry both cases within the same budget spent above.
 		needsRetry := func(res *proxy.RecoveryResult) bool {
 			return res.HealthyCount == 0 &&
 				(res.State == proxy.StartupFailed || res.State == proxy.StartupRecovering)
@@ -495,7 +507,6 @@ func executeRecovery(
 			}
 			recoveryResult, err = source.DiscoverAndValidateBackends(retryCtx)
 		}
-		retryCancel()
 		if err != nil {
 			log.Error("recovery: discovery failed",
 				zap.Error(err))
