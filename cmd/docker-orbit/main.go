@@ -303,7 +303,7 @@ func runProxy(log *zap.Logger, version string) error {
 
 	// Bind ports.
 	for _, binding := range cfg.Binds {
-		if err := srv.Bind(proxy.PortBinding{ListenPort: binding.ListenPort, TargetPort: binding.TargetPort}); err != nil {
+		if err := srv.Bind(proxy.PortBinding{ListenPort: binding.ListenPort, TargetPort: binding.TargetPort}, router); err != nil {
 			log.Error("proxy: bind failed", zap.Error(err))
 			return err
 		}

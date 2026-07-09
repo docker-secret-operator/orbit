@@ -48,20 +48,20 @@ func dialTimeout(t *testing.T, addr string) net.Conn {
 	return conn
 }
 
-func newTestServer(t *testing.T) (*proxy.Registry, *proxy.Server) {
+func newTestServer(t *testing.T) (*proxy.Registry, *proxy.Router, *proxy.Server) {
 	t.Helper()
 	reg := proxy.NewRegistry()
 	router := proxy.NewRouter(reg)
 	srv := proxy.NewServer(router, nopLogger(), metrics.New())
 	t.Cleanup(srv.Close)
-	return reg, srv
+	return reg, router, srv
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 func TestServer_Bind_Unbind(t *testing.T) {
-	_, srv := newTestServer(t)
-	if err := srv.Bind(proxy.PortBinding{ListenPort: 0}); err != nil {
+	_, router, srv := newTestServer(t)
+	if err := srv.Bind(proxy.PortBinding{ListenPort: 0}, router); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 	bindings := srv.Bindings()
@@ -81,10 +81,10 @@ func TestServer_Bind_Unbind(t *testing.T) {
 }
 
 func TestServer_DuplicateBind_ReturnsError(t *testing.T) {
-	_, srv := newTestServer(t)
-	srv.Bind(proxy.PortBinding{ListenPort: 0}) //nolint:errcheck
+	_, router, srv := newTestServer(t)
+	srv.Bind(proxy.PortBinding{ListenPort: 0}, router) //nolint:errcheck
 	port := srv.Bindings()[0].ListenPort
-	err := srv.Bind(proxy.PortBinding{ListenPort: port})
+	err := srv.Bind(proxy.PortBinding{ListenPort: port}, router)
 	if err == nil {
 		t.Fatal("want error for duplicate bind, got nil")
 	}
@@ -92,13 +92,13 @@ func TestServer_DuplicateBind_ReturnsError(t *testing.T) {
 
 func TestServer_EndToEnd_TCPProxy(t *testing.T) {
 	echoAddr := echoServer(t)
-	reg, srv := newTestServer(t)
+	reg, router, srv := newTestServer(t)
 
 	// Register the echo server as a backend.
 	reg.Add(proxy.Backend{ID: "echo", Addr: echoAddr}) //nolint:errcheck
 
 	// Bind a proxy port.
-	srv.Bind(proxy.PortBinding{ListenPort: 0}) //nolint:errcheck
+	srv.Bind(proxy.PortBinding{ListenPort: 0}, router) //nolint:errcheck
 	proxyPort := srv.Bindings()[0].ListenPort
 
 	// Connect through the proxy.
@@ -131,7 +131,7 @@ func TestServer_NilMetrics_DoesNotPanic(t *testing.T) {
 	echoAddr := echoServer(t)
 	reg.Add(proxy.Backend{ID: "echo", Addr: echoAddr}) //nolint:errcheck
 
-	if err := srv.Bind(proxy.PortBinding{ListenPort: 0}); err != nil {
+	if err := srv.Bind(proxy.PortBinding{ListenPort: 0}, router); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 	proxyPort := srv.Bindings()[0].ListenPort
@@ -148,8 +148,8 @@ func TestServer_NilMetrics_DoesNotPanic(t *testing.T) {
 }
 
 func TestServer_NoBackend_ConnectionDropped(t *testing.T) {
-	_, srv := newTestServer(t)                 // empty registry
-	srv.Bind(proxy.PortBinding{ListenPort: 0}) //nolint:errcheck
+	_, router, srv := newTestServer(t)                 // empty registry
+	srv.Bind(proxy.PortBinding{ListenPort: 0}, router) //nolint:errcheck
 	proxyPort := srv.Bindings()[0].ListenPort
 
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), time.Second)
@@ -174,10 +174,10 @@ func TestServer_RoundRobin_MultipleBackends(t *testing.T) {
 	addr1 := echoServer(t)
 	addr2 := echoServer(t)
 
-	reg, srv := newTestServer(t)
-	reg.Add(proxy.Backend{ID: "e1", Addr: addr1}) //nolint:errcheck
-	reg.Add(proxy.Backend{ID: "e2", Addr: addr2}) //nolint:errcheck
-	srv.Bind(proxy.PortBinding{ListenPort: 0})    //nolint:errcheck
+	reg, router, srv := newTestServer(t)
+	reg.Add(proxy.Backend{ID: "e1", Addr: addr1})      //nolint:errcheck
+	reg.Add(proxy.Backend{ID: "e2", Addr: addr2})      //nolint:errcheck
+	srv.Bind(proxy.PortBinding{ListenPort: 0}, router) //nolint:errcheck
 	proxyPort := srv.Bindings()[0].ListenPort
 
 	// Make 4 connections; round-robin should alternate.

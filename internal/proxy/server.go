@@ -79,12 +79,17 @@ func NewServer(router *Router, log *zap.Logger, m *metrics.Proxy) *Server {
 // SetRetryPolicy overrides the passive-failover retry policy. Startup-only.
 func (s *Server) SetRetryPolicy(p RetryPolicy) { s.retry = p }
 
-// Bind opens a TCP listener for the given PortBinding. Accepts connections
-// asynchronously; returns once the listener is open.
+// Bind opens a TCP listener for the given PortBinding, routing its traffic
+// through router. Accepts connections asynchronously; returns once the
+// listener is open.
 //
 // If ListenPort is 0, the OS assigns a free port. The real assigned port is
 // stored in the map key and in the returned Bindings() snapshot.
-func (s *Server) Bind(b PortBinding) error {
+//
+// router is stored per-port (s.routers) but not yet consulted by
+// dialWithFailover — that happens in ADR-0006 Stage 1 PR 4. Until then,
+// routing still goes through the single router passed to NewServer.
+func (s *Server) Bind(b PortBinding, router *Router) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -104,6 +109,7 @@ func (s *Server) Bind(b PortBinding) error {
 
 	pl := &portListener{binding: b, listener: ln, done: make(chan struct{})}
 	s.listeners[realPort] = pl
+	s.routers[realPort] = router
 	go s.acceptLoop(pl)
 
 	s.log.Info("proxy: port bound", zap.Int("port", realPort))
@@ -123,6 +129,7 @@ func (s *Server) Unbind(listenPort int) error {
 	close(pl.done)
 	pl.listener.Close()
 	delete(s.listeners, listenPort)
+	delete(s.routers, listenPort)
 	s.log.Info("proxy: port unbound", zap.Int("port", listenPort))
 	return nil
 }
@@ -138,6 +145,7 @@ func (s *Server) Close() {
 		close(pl.done)
 		pl.listener.Close()
 		delete(s.listeners, port)
+		delete(s.routers, port)
 	}
 	s.log.Info("proxy: all ports closed")
 }
@@ -158,6 +166,7 @@ func (s *Server) CloseGraceful(timeout time.Duration) error {
 		close(pl.done)
 		pl.listener.Close()
 		delete(s.listeners, port)
+		delete(s.routers, port)
 	}
 	s.mu.Unlock()
 
