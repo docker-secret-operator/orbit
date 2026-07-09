@@ -118,6 +118,16 @@ func buildProxyPair(name string, svc Service) (backing Service, proxy Service, e
 		backing.Expose = appendUnique(backing.Expose, strconv.Itoa(pp.container))
 	}
 
+	// A fixed container_name makes `docker compose up --scale <service>=2`
+	// — the mechanism every rollout/deploy uses to start the new container
+	// alongside the old one — fail outright ("Docker requires each container
+	// to have a unique name"). Any service Orbit injects a proxy for will be
+	// scaled during its first rollout, so a name fixed at generate time is
+	// incompatible with the one thing this file exists to enable. Docker
+	// falls back to its own generated name (<project>-<service>-<n>), which
+	// is what every other multi-replica Compose service already uses.
+	delete(backing.RawFields, "container_name")
+
 	// Join docker_rollout_mesh. If the service had no explicit networks it was on the
 	// implicit "default" network; preserve that so it can still reach stateful
 	// services (db, redis) that are not on docker_rollout_mesh.

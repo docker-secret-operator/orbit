@@ -222,3 +222,31 @@ func TestGenerate_NilInput_ReturnsError(t *testing.T) {
 		t.Fatal("want error for nil input, got nil")
 	}
 }
+
+// TestGenerate_StripsContainerName guards against a real, confirmed bug: a
+// fixed container_name (common — the reference test stack this project was
+// verified against sets one on every service) makes `docker compose up
+// --scale <service>=2` refuse to run at all ("Docker requires each
+// container to have a unique name"), which is the exact mechanism every
+// rollout/deploy depends on. Any service Orbit injects a proxy for will be
+// scaled during its first rollout, so a name fixed at generate time is
+// incompatible with the one thing this file exists to enable.
+func TestGenerate_StripsContainerName(t *testing.T) {
+	const input = `
+services:
+  api:
+    image: myapp:latest
+    container_name: api
+    ports:
+      - "3000:3000"
+`
+	cf := parse(t, input)
+	out, _, err := compose.Generate(cf)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	api := out.Services["api"]
+	if _, ok := api.RawFields["container_name"]; ok {
+		t.Errorf("backing service still has container_name = %v, want stripped", api.RawFields["container_name"])
+	}
+}
