@@ -86,15 +86,15 @@ Estimates, not measurements — intended to catch a stage whose growth is wildly
 | Stage | Files +/− | LOC +/− | Interfaces +/− | Goroutines +/− | Mutexes +/− |
 |---|---|---|---|---|---|
 | 1 | 0 / 0 (2 modified) | +80 / −10 | 1 changed (`Bind` signature) | 0 net (still one per accepted connection; per-port routing resolution adds no new goroutine) | 0 net |
-| 2 | +2 / 0 | +300 / 0 | +2 (`ProjectRegistry`, health-controller wrapper) | **+2 net** (one sequential recovery-loop ticker, one sequential health-check ticker, replacing what were previously single-service-scoped goroutines of the same two kinds — net new is the "outer loop" wrapper, not one per service, per II-4) | +1 (`ProjectRegistry.mu`) |
+| 2 | +2 / 0 | +300 / 0 | +2 (`ProjectRegistry`, health-controller wrapper) | **+2 net when wired** (one sequential recovery-loop ticker, one sequential health-check ticker, replacing what were previously single-service-scoped goroutines of the same two kinds — net new is the "outer loop" wrapper, not one per service, per II-4) | **+2** (`ProjectRegistry.mu`, `ProjectHealthController.mu`) — corrected from the original +1 estimate; see [governance review 01](ADR-0006-governance-review-01.md) §3/§11. `ProjectHealthController.mu` guards its per-service controller cache, mirroring `HealthController`'s own pre-existing `evalMu` pattern |
 | 3c | +2 / 0 | +150 / 0 | +2 (`ServicesConfig`, `ServiceConfig`) | 0 | 0 |
 | 3a/3b | +1 / 0 (2 modified) | +200 / −50 | 1 changed (`ControlServer` constructor) | 0 | 0 |
 | 4 | +2 / 0 | +350 / 0 | +1 (`EventSource` or equivalent) | **+2 net** (one event-subscription goroutine, one reconciliation-ticker goroutine — both process-wide per II-4, not per-service) | 0 (reuses existing `Registry`/`ProjectRegistry` locks) |
 | 5 | 0 / 0 (1 modified) | +150 / 0 (old path untouched, new path additive) | 0 | 0 | 0 |
 | 6 | 0 / 0 (2 modified) | +50 / 0 | 0 | 0 | 0 |
-| **Subtotal, Stages 1-6** | **+5 / 0** | **+1280 / −60** | **+6** | **+4** | **+1** |
+| **Subtotal, Stages 1-6** | **+5 / 0** | **+1280 / −60** | **+6** | **+4** | **+2** |
 | **7 (deletion)** | **0 / ~4-6** | **~−600 / 0** | **~−3** (old constructor, old handler shapes, `ProxyInstance`-derived helper types) | 0 | 0 |
-| **Net, end state** | **+5 / ~−5** | **≈ +620** | **≈ +3** | **+4** | **+1** |
+| **Net, end state** | **+5 / ~−5** | **≈ +620** | **≈ +3** | **+4** | **+2** |
 
 **Honest answer to "does complexity decrease every stage":** no, and it would be dishonest to claim otherwise — Stages 1-6 are a net *feature addition* (one proxy process serving N services instead of one), and that is real, irreducible complexity relative to today's single-service code. What should be true, and what this budget is checked against, is:
 
