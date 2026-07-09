@@ -40,12 +40,23 @@ traffic, poll per-service health, or run its own persistence/WAL.
 ## What remains before activation (see the design doc for the full register)
 
 Priority P0 (blocks any real use):
-- Remove the duplicate deployment engine (`docker_integration.go`).
-- Remove the placeholder Docker client (`docker_client.go` `RealDockerClient`)
-  and the SDK client (`docker_sdk_client.go`) — Docker is rollout's job.
-- Remove the duplicate persistence/WAL (`state_persistence.go`) — delegate to
-  `internal/state`.
-- Fix the data race on `StackRollout.state` (add synchronization).
+- [x] Remove the duplicate deployment engine (`docker_integration.go`) —
+  done 2026-07-09. Its methods were unconditional placeholders (`// Placeholder:
+  actual Docker SDK integration would go here`, returning fabricated
+  `mock-<name>-<timestamp>` container IDs even from the "real" client) — not
+  partially-working code, fully inert.
+- [x] Remove the placeholder Docker client (`docker_client.go`
+  `RealDockerClient`) and the SDK client (`docker_sdk_client.go`) — done
+  2026-07-09. `MockDockerClient` and the `DockerClient` interface
+  (`docker_types.go`) are unchanged and still back `docker_transaction.go` /
+  `health_monitor.go` / their tests. This also drops this package's only
+  `github.com/docker/docker` SDK import — see SECURITY.md's CVE note.
+- [x] Remove the duplicate persistence/WAL (`state_persistence.go`) — done
+  2026-07-09; nothing else in the package referenced it. Delegating to
+  `internal/state` is still open — see P1.
+- [ ] Fix the data race on `StackRollout.state` (add synchronization).
+
+Package size: 4,149 → 2,822 non-test LOC (-32%) after the removals above.
 
 Priority P1 (blocks production):
 - Add the missing orchestration driver (level-walk `Execute()` loop).

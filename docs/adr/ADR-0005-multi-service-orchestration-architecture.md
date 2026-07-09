@@ -110,3 +110,35 @@ CLI wiring stage:
 
 Rollback of the migration itself is trivial at every stage before step 7: until
 the CLI is wired, `internal/stack` remains imported by zero commands.
+
+## Amendment (2026-07-09): Stage 2 (partial) — Excise Duplication
+
+**Status:** Implemented (P0 items 1–3 of 4)
+
+As part of a broader production-readiness pass on the v1 engine, Migration
+Strategy stage 2 was executed for three of its four items:
+
+- Removed `docker_integration.go` (the duplicate deployment engine) and its
+  test file. Every method was an unconditional placeholder — e.g.
+  `CreateContainer` logged "creating container" and returned a fabricated
+  `mock-<name>-<timestamp>` ID without touching Docker — so this was inert
+  code, not a working alternate path.
+- Removed `docker_client.go`'s `RealDockerClient` and all of
+  `docker_sdk_client.go` (the SDK-backed client), plus their test files.
+  `RealDockerClient`'s methods carried the identical placeholder pattern.
+  `MockDockerClient` and the `DockerClient` interface (`docker_types.go`) are
+  unchanged — `docker_transaction.go` and `health_monitor.go` still compile
+  and test against them unmodified.
+- Removed `state_persistence.go` (the duplicate WAL/persistence layer) and
+  its test file. Nothing else in the package referenced its types.
+
+Not done in this pass: item 4 (fix the `StackRollout.state` data race) and
+all of stage 4's "add the driver" work — those require actual new logic,
+not excision, and are out of scope for a dead-code removal pass.
+
+**Effect:** `internal/stack` is 4,149 → 2,822 non-test LOC (-32%). It no
+longer imports `github.com/docker/docker` at all, which narrows
+`docs/governance/SECURITY.md`'s `docker@v24` CVE exposure note (updated
+separately). The freeze this ADR established is otherwise unchanged: the
+package still has zero importers outside itself, v1 behavior is unaffected,
+and stages 3–7 of the migration strategy above remain exactly as written.

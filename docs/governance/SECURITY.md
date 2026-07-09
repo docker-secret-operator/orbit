@@ -26,7 +26,7 @@ From the Product Contract in [CONSTITUTION.md](../../CONSTITUTION.md#product-con
 As of this document, CI runs [`govulncheck`](https://github.com/golang/vuln) on every push/PR (`.github/workflows/ci.yml`) — it did not before. A scan at the time this was added found:
 
 - **9 vulnerabilities in the Go standard library** (`crypto/x509`, `crypto/tls`, `net`, `net/http`, `net/textproto`) — all fixed in later 1.26.x patch releases. CI's `setup-go@v5` pins `go-version: '1.26'` (not a specific patch), which resolves to the latest available 1.26.x automatically, so CI builds are not actually exposed to these even though a locally pinned `go1.26.1` toolchain is.
-- **6 vulnerabilities in `github.com/docker/docker@v24.0.7+incompatible`** — one (`GO-2025-3829`) has a fix available by upgrading to v25.0.13+incompatible; this is a **major version bump** with real breaking-change risk across `internal/stack`, `internal/proxy`, and `internal/volumes`, and was deliberately not performed as part of a stabilization pass. See the Dependency Audit / Technical Debt Register for the recommendation.
+- **6 vulnerabilities in `github.com/docker/docker@v24.0.7+incompatible`** — one (`GO-2025-3829`) has a fix available by upgrading to v25.0.13+incompatible; this is a **major version bump** with real breaking-change risk across `internal/proxy` and `internal/volumes`, and was deliberately not performed as part of a stabilization pass. See the Dependency Audit / Technical Debt Register for the recommendation. (`internal/stack` no longer imports this SDK as of ADR-0005's 2026-07-09 amendment — its only usage was in the placeholder Docker client removed in that pass.)
 
 ## Secrets & Configuration
 
