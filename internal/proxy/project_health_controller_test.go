@@ -257,3 +257,52 @@ func TestProjectHealthController_LogsCarryServiceField(t *testing.T) {
 		t.Error("expected at least one transition log tagged service=api")
 	}
 }
+
+// TestProjectHealthController_MatchesSingleServiceWiring is the Stage 3.3
+// wiring-equivalence test: constructs a ProjectHealthController the exact
+// way runProxy does (one registered service, DefaultHealthControllerConfig,
+// and — critically — reg.SetZeroBackendHook set on the raw *Registry
+// *before* wrapping it), and proves zero-backend protection still fires
+// correctly through the internal HealthController ProjectHealthController
+// constructs. This is what "orchestration only, health logic unchanged"
+// means made concrete: SetHealthGuarded's zero-backend guard, and the hook
+// runProxy wires to it, are both completely untouched by this stage — this
+// test is the proof, not an assertion.
+func TestProjectHealthController_MatchesSingleServiceWiring(t *testing.T) {
+	reg := NewRegistry()
+	if err := reg.Add(Backend{ID: "solo", Addr: "10.0.0.1:80"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var hookFired bool
+	var hookID string
+	reg.SetZeroBackendHook(func(id string) {
+		hookFired = true
+		hookID = id
+	})
+
+	pr := NewProjectRegistry()
+	pr.Register("svc", reg)
+
+	prober := newCountingProber()
+	prober.set("10.0.0.1:80", false) // the only backend — always fails
+
+	// The exact construction pattern runProxy uses.
+	phc := NewProjectHealthController(pr, prober, DefaultHealthControllerConfig(), nil, nil)
+	ctx := context.Background()
+
+	cfg := DefaultHealthControllerConfig()
+	for i := 0; i < cfg.UnhealthyThreshold; i++ {
+		phc.CheckOnce(ctx)
+	}
+
+	if st, _ := reg.State("solo"); st != StateActive {
+		t.Fatalf("zero-backend protection must keep the last active backend active, got %s", st)
+	}
+	if !hookFired {
+		t.Fatal("zero-backend hook must fire when demotion is refused, through the ProjectHealthController path exactly as it would through a bare HealthController")
+	}
+	if hookID != "solo" {
+		t.Fatalf("hook must report the correct backend ID, got %q", hookID)
+	}
+}

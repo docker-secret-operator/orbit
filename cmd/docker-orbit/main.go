@@ -394,13 +394,23 @@ func runProxy(log *zap.Logger, version string) error {
 		log.Warn("runtime: continuous health NOT activated (prerequisites unmet)", zap.Error(err))
 	} else {
 		// Zero-backend protection: a refused demotion emits a warning + metric.
+		// Set directly on reg (unchanged) — ProjectHealthController's internal
+		// HealthController for this service wraps this exact *Registry
+		// instance (via pr.For), so the hook fires exactly as it did before
+		// this stage; nothing about SetHealthGuarded's behavior changed.
 		reg.SetZeroBackendHook(func(id string) {
 			m.IncZeroBackendProtection()
 			log.Warn("runtime: zero-backend protection kept the last active backend",
 				zap.String("backend", id))
 		})
-		hc := proxy.NewHealthController(reg, nil, proxy.DefaultHealthControllerConfig(), m, log)
-		go hc.Run(ctx) // stops when the shutdown signal cancels ctx
+		// ADR-0006 Stage 3.3: ProjectHealthController orchestrates — it is not
+		// a second health implementation, it constructs one unmodified
+		// HealthController per service internally (today: exactly one, this
+		// service) and drives it with the identical config. See II-4: one
+		// ticker, one goroutine, sequential iteration — not a goroutine per
+		// service.
+		phc := proxy.NewProjectHealthController(pr, nil, proxy.DefaultHealthControllerConfig(), m, log)
+		go phc.Run(ctx) // stops when the shutdown signal cancels ctx
 		log.Info("runtime: continuous health controller activated via feature gate")
 	}
 
