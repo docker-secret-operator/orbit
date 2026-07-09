@@ -4,6 +4,8 @@
 **Date:** 2026-07-09
 **Inputs:** ADR-0003, ADR-0005, [ADR-0006 (amended)](ADR-0006-shared-proxy-and-event-driven-discovery.md), [ADR-0006 validation review](ADR-0006-validation-review.md), AUTHORITY-LIFECYCLE.md, CONSTITUTION.md, and the current implementation — every claim below was checked against the actual source, not against the ADR's description of it.
 
+**Implementation status:** Stage 1 (`Server` per-binding router) — **complete**, 5/5 checklist items landed as individually reviewable commits (`3bc82f1`..`16d489f`), each gated on build/full-suite/`-race`; PR 4 (the behavior-changing step) additionally live-verified against a real backend on the reference stack. See [pre-implementation audit](ADR-0006-pre-implementation-audit.md) §8 for the exit checklist applied to each item. Stages 2-7: not started.
+
 ---
 
 ## The one contradiction implementation would reveal
@@ -249,9 +251,9 @@ Already walked through above (control-API flows). **No missing transition** anyw
 
 Each item modifies one subsystem, and carries its own compile/test/docs/review gate per the amended ADR's per-stage requirement.
 
-- [ ] **1.1** Add `Service string` to `PortBinding`. Compiles alone; no behavior change yet.
-- [ ] **1.2** Change `Server.router *Router` → `Server.routers map[int]*Router`; change `Bind(b PortBinding) error` → `Bind(b PortBinding, router *Router) error`; thread `pl *portListener` through `handleConn` so `dialWithFailover` resolves the correct router. Update the one existing call site (`runProxy`) and four test files.
-- [ ] **1.3** New test: two `Server.Bind` calls with two distinct routers; assert traffic on each port only ever reaches its own router's registry. This is the test that proves the contradiction is actually fixed, not just recompiled around.
+- [x] **1.1** Add `Service string` to `PortBinding`. Compiles alone; no behavior change yet. — `3bc82f1`
+- [x] **1.2** Change `Server.router *Router` → `Server.routers map[int]*Router`; change `Bind(b PortBinding) error` → `Bind(b PortBinding, router *Router) error`; thread `pl *portListener` through `handleConn` so `dialWithFailover` resolves the correct router. Update the one existing call site (`runProxy`) and four test files. — landed as three separate commits (`55e6719` routers map, `54a7a99` Bind signature, `f14259a` handleConn threading + removal of the singular field), not one, per the reviewer's request to keep each logical change independently reviewable; actual test-file fallout was six files, not four (the original grep for this plan missed three `internal/api` test files that also construct `proxy.NewServer`)
+- [x] **1.3** New test: two `Server.Bind` calls with two distinct routers; assert traffic on each port only ever reaches its own router's registry. This is the test that proves the contradiction is actually fixed, not just recompiled around. — `TestServer_CrossPortIsolation`, `16d489f`
 - [ ] **2.1** New `internal/proxy/project_registry.go`: `ProjectRegistry` type, `For(service) (*Registry, bool)`, constructor.
 - [ ] **2.2** New `ProjectHealthController` wrapping N per-service `HealthController` instances behind one shared ticker.
 - [ ] **2.3** `executeRecovery`'s call site becomes a loop over configured services, each iteration unchanged internally (INV-1/INV-6/INV-10 — verify no changes needed inside `state.GenerateRecoveryPlan` itself, per this review's confirmation in § Interface Changes).
