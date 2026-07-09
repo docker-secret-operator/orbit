@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -12,6 +13,18 @@ import (
 	"github.com/docker/docker/client"
 	"go.uber.org/zap"
 )
+
+// ErrNotIDVerifiable is returned by VerifyBackendByID when backendID's
+// format disqualifies it from ID-based verification entirely — the
+// "<service>-default" seed sentinel, an ID belonging to a different
+// instance, or a malformed suffix. Distinct from a genuine Docker-level
+// negative result (container gone, wrong service, unhealthy): callers
+// should treat this case as "this mechanism doesn't apply, defer to
+// whatever the label-based scan already knows" rather than "this was
+// checked and proven false" — the seed sentinel in particular is a value
+// the label-based scan already resolves correctly on its own, so treating
+// it as disproven would discard trust that was never actually in question.
+var ErrNotIDVerifiable = errors.New("backend ID not eligible for direct verification")
 
 // DockerRecoverySource discovers and validates backends from Docker containers.
 type DockerRecoverySource struct {
@@ -294,14 +307,14 @@ func (d *DockerRecoverySource) extractBackend(ctx context.Context, c types.Conta
 func (d *DockerRecoverySource) VerifyBackendByID(ctx context.Context, backendID string) (*Backend, error) {
 	prefix := d.proxyInstance + "-"
 	if !strings.HasPrefix(backendID, prefix) {
-		return nil, fmt.Errorf("backend ID %q does not belong to instance %q", backendID, d.proxyInstance)
+		return nil, fmt.Errorf("%w: backend ID %q does not belong to instance %q", ErrNotIDVerifiable, backendID, d.proxyInstance)
 	}
 	shortID := strings.TrimPrefix(backendID, prefix)
 	if shortID == "default" {
-		return nil, fmt.Errorf("%q is the seed sentinel, not a container-ID-based backend — use label-based discovery", backendID)
+		return nil, fmt.Errorf("%w: %q is the seed sentinel, not a container-ID-based backend — use label-based discovery", ErrNotIDVerifiable, backendID)
 	}
 	if len(shortID) < 6 { // Docker's own minimum unambiguous short-ID length
-		return nil, fmt.Errorf("backend ID %q does not contain a usable container-ID suffix", backendID)
+		return nil, fmt.Errorf("%w: backend ID %q does not contain a usable container-ID suffix", ErrNotIDVerifiable, backendID)
 	}
 
 	inspect, err := d.client.ContainerInspect(ctx, shortID)

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -281,6 +282,16 @@ func TestVerifyBackendByID_FailsClosed(t *testing.T) {
 			}
 			if backend != nil {
 				t.Errorf("VerifyBackendByID(%q) backend = %+v, want nil on error", tc.backendID, backend)
+			}
+			// Every one of these is a format-level rejection — none of them
+			// ever reach a real Docker call — so all must wrap
+			// ErrNotIDVerifiable. This is the distinction
+			// cmd/docker-orbit/main.go's directVerifyRecoveryResult depends
+			// on to avoid discarding still-valid persisted state (e.g. the
+			// seed sentinel, which the label-based scan resolves correctly
+			// on its own) versus a genuine Docker-proven negative result.
+			if !errors.Is(err, ErrNotIDVerifiable) {
+				t.Errorf("VerifyBackendByID(%q) error = %v, want it to wrap ErrNotIDVerifiable", tc.backendID, err)
 			}
 		})
 	}

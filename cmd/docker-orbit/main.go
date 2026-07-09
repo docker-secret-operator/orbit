@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -524,10 +525,28 @@ func executeRecovery(
 		// below — a label-based scan can never find a per-rollout backend ID
 		// (the label is static per service, identical across every replica),
 		// so without this, persisted authority would always look stale.
-		// Returns nil (never partially applies) when there's nothing to
-		// verify or verification fails, in which case the label-based scan
-		// runs exactly as it always has.
-		recoveryResult = directVerifyRecoveryResult(retryCtx, source, activeGenState, rolloutState, log)
+		var provenStale bool
+		recoveryResult, provenStale = directVerifyRecoveryResult(retryCtx, source, activeGenState, rolloutState, log)
+		if provenStale {
+			// Direct-verify didn't just find "nothing to check" — it proved
+			// the persisted ID no longer corresponds to a live container
+			// (e.g. every container ID changed after a host reboot). The
+			// label-based scan below will still correctly find a healthy
+			// backend under its current label, but determineAuthority
+			// (internal/state) trusts activeGenState/rolloutState
+			// unconditionally when non-nil — it has no way to know they
+			// were just disproven. Passing them through unchanged here
+			// makes GenerateRecoveryPlan compare a live, label-keyed
+			// inventory against a dead, ID-keyed authority string that can
+			// never match, producing a false RecoveryDegraded with a
+			// perfectly healthy backend sitting right there — and since
+			// this reloads the same stale file every time, it never
+			// self-heals, including through the periodic rediscovery loop
+			// in runProxy. Treating persisted state as absent for the rest
+			// of this pass is what actually makes the fallback a fallback.
+			activeGenState = nil
+			rolloutState = nil
+		}
 
 		// Discover and validate backends with health checks. A backend that
 		// hasn't opened its port yet (e.g. Grafana takes several seconds to
@@ -659,21 +678,39 @@ func executeRecovery(
 				zap.String("generation", plan.AuthoritativeGeneration),
 				zap.String("reason", plan.Reason))
 
-			// This branch only runs when no persisted authority existed at
-			// all (determineAuthority's Priority 1/2 both require it to be
-			// non-nil to skip inference — see AUTHORITY-LIFECYCLE.md §1.3).
+			// This branch runs both when no persisted authority ever existed
+			// (determineAuthority's Priority 1/2 require activeGenState/
+			// rolloutState non-nil to skip inference) AND when direct-verify
+			// just proved an existing one stale and this pass nulled it out
+			// (see directVerifyRecoveryResult's provenStale doc) — the second
+			// case means a real file, with a real revision, is still on disk.
 			// Persist what was just inferred so the *next* boot gets a
-			// trusted restore instead of inferring again. Same-process
-			// write (sm, not the HTTP /authority/* path a separate CLI
-			// process must use) — best-effort, never fails the recovery
-			// pass itself.
+			// trusted restore instead of inferring again — reading the
+			// current on-disk revision first (same pattern
+			// internal/api/authority.go's handlers use) so this correctly
+			// overwrites a stale entry via CAS instead of being silently
+			// rejected as a conflicting write. Same-process write (sm, not
+			// the HTTP /authority/* path a separate CLI process must use) —
+			// best-effort, never fails the recovery pass itself.
 			if registeredCount > 0 {
-				if err := sm.WriteActiveGenerationState(&state.ActiveGenerationState{
+				newActiveGen := &state.ActiveGenerationState{
 					SchemaVersion:    state.SchemaVersion,
 					Service:          cfg.ProxyInstance,
 					ActiveGeneration: plan.AuthoritativeGeneration,
-				}, log); err != nil {
+				}
+				if current, loadErr := sm.LoadActiveGenerationState(cfg.ProxyInstance); loadErr == nil && current != nil {
+					newActiveGen.PreviousRevision = current.Revision
+				}
+				if err := sm.WriteActiveGenerationState(newActiveGen, log); err != nil {
 					log.Warn("recovery: could not persist inferred authority (non-fatal)", zap.Error(err))
+				}
+				// A stale in-flight RolloutState (the provenStale
+				// transitioning case) is superseded by the fresh single-
+				// generation authority just written above — clear it so a
+				// future boot doesn't keep reloading and re-disproving the
+				// same dead transition on every single recovery pass.
+				if err := sm.DeleteRolloutState(cfg.ProxyInstance); err != nil {
+					log.Warn("recovery: could not clear stale rollout state (non-fatal)", zap.Error(err))
 				}
 			}
 
@@ -726,16 +763,35 @@ func executeRecovery(
 // directly against Docker via source.VerifyBackendByID, bypassing the broad
 // label-based scan. See docs/governance/AUTHORITY-LIFECYCLE.md and
 // executeRecovery's call site for why this must run first, not as a
-// fallback. Returns nil — never a partial result — when there is nothing
-// persisted to verify or verification fails, which tells the caller to run
-// the existing label-based scan exactly as if this function didn't exist.
+// fallback.
+//
+// Returns (nil, false) when there is nothing persisted to verify — the
+// caller runs the label-based scan and trusts activeGenState/rolloutState
+// exactly as it always has.
+//
+// Returns (nil, true) when persisted state exists but direct-verify PROVED
+// it stale (the container it names no longer exists, or failed health).
+// This is the critical case: caller MUST discard activeGenState/
+// rolloutState before falling back to the label-based scan, not merely
+// fall back to it while still holding them. A stale persisted generation
+// string that GenerateRecoveryPlan's determineAuthority still trusts
+// (state.go's Priority 1/2) will never match anything in a label-keyed
+// inventory — a live rollout's backend ID was never a label — so
+// determineRecoveryAction sees "authority exists, 0 healthy, 0 unhealthy"
+// (map miss, not a real health verdict) and goes RecoveryDegraded even
+// though the label scan just found a perfectly healthy backend under its
+// current, correct label. This was caught live: after simulating a host
+// reboot (full container recreation — new container IDs, persisted volume
+// intact), the proxy got stuck in a permanent, never-self-healing degraded
+// state despite `docker orbit status` and the label scan agreeing a
+// healthy backend existed the entire time.
 func directVerifyRecoveryResult(
 	ctx context.Context,
 	source *proxy.DockerRecoverySource,
 	activeGenState *state.ActiveGenerationState,
 	rolloutState *state.RolloutState,
 	log *zap.Logger,
-) *proxy.RecoveryResult {
+) (result *proxy.RecoveryResult, provenStale bool) {
 	start := time.Now()
 
 	// Interrupted rollout: verify the new generation first — it's the one
@@ -749,7 +805,13 @@ func directVerifyRecoveryResult(
 		if err != nil {
 			log.Info("recovery: direct-verify of in-flight new generation failed, falling back to label scan",
 				zap.String("id", rolloutState.NewGeneration), zap.Error(err))
-			return nil
+			// ErrNotIDVerifiable means this ID was never eligible for this
+			// mechanism (e.g. the seed sentinel) — the label scan can
+			// resolve it correctly on its own, so the persisted state isn't
+			// actually disproven and must not be discarded. Only a genuine
+			// Docker-level negative result (container gone/unhealthy) means
+			// the fallback needs to run without it.
+			return nil, !errors.Is(err, proxy.ErrNotIDVerifiable)
 		}
 		backends := []proxy.BackendHealth{directVerifiedHealth(*newBackend)}
 		if rolloutState.OldGeneration != "" {
@@ -769,7 +831,7 @@ func directVerifyRecoveryResult(
 			TotalDiscovered: len(backends),
 			RecoveredAt:     time.Now(),
 			DurationMs:      time.Since(start).Milliseconds(),
-		}
+		}, false
 	}
 
 	// Steady state: one persisted, trusted generation.
@@ -778,7 +840,11 @@ func directVerifyRecoveryResult(
 		if err != nil {
 			log.Info("recovery: direct-verify of persisted authority failed, falling back to label scan",
 				zap.String("id", activeGenState.ActiveGeneration), zap.Error(err))
-			return nil
+			// See the AuthorityTransitioning branch above for why
+			// ErrNotIDVerifiable (e.g. the seed sentinel) must not count as
+			// disproving the persisted value — the label scan resolves it
+			// correctly on its own.
+			return nil, !errors.Is(err, proxy.ErrNotIDVerifiable)
 		}
 		log.Info("recovery: restored via direct-verify (trusted persisted authority)",
 			zap.String("generation", activeGenState.ActiveGeneration))
@@ -789,10 +855,10 @@ func directVerifyRecoveryResult(
 			TotalDiscovered: 1,
 			RecoveredAt:     time.Now(),
 			DurationMs:      time.Since(start).Milliseconds(),
-		}
+		}, false
 	}
 
-	return nil
+	return nil, false
 }
 
 func directVerifiedHealth(b proxy.Backend) proxy.BackendHealth {
