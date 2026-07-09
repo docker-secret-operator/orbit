@@ -46,28 +46,30 @@ type portListener struct {
 //
 // All public methods are safe for concurrent use.
 type Server struct {
-	router  *Router
 	log     *zap.Logger
 	metrics *metrics.Proxy
 
 	mu          sync.RWMutex
 	listeners   map[int]*portListener // real listen port → listener
-	routers     map[int]*Router       // real listen port → router (ADR-0006 Stage 1; not yet consulted)
+	routers     map[int]*Router       // real listen port → router
 	activeConns sync.WaitGroup        // tracks in-flight connections for graceful drain
 
 	retry RetryPolicy // passive-failover retry policy (WP-B2)
 }
 
-// NewServer creates a proxy server backed by the given router and metrics.
+// NewServer creates a proxy server. Each bound port supplies its own Router
+// via Bind — a Server has no router of its own until at least one port is
+// bound (ADR-0006: a shared proxy fronts multiple services, each with its
+// own routing table).
+//
 // m may be nil (defaults to a fresh no-op-equivalent sink): every connection
 // path calls s.metrics methods unconditionally, and *metrics.Proxy's methods
 // are not nil-receiver-safe.
-func NewServer(router *Router, log *zap.Logger, m *metrics.Proxy) *Server {
+func NewServer(log *zap.Logger, m *metrics.Proxy) *Server {
 	if m == nil {
 		m = metrics.New()
 	}
 	return &Server{
-		router:    router,
 		log:       log,
 		metrics:   m,
 		listeners: make(map[int]*portListener),
@@ -85,10 +87,6 @@ func (s *Server) SetRetryPolicy(p RetryPolicy) { s.retry = p }
 //
 // If ListenPort is 0, the OS assigns a free port. The real assigned port is
 // stored in the map key and in the returned Bindings() snapshot.
-//
-// router is stored per-port (s.routers) but not yet consulted by
-// dialWithFailover — that happens in ADR-0006 Stage 1 PR 4. Until then,
-// routing still goes through the single router passed to NewServer.
 func (s *Server) Bind(b PortBinding, router *Router) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -210,7 +208,19 @@ func (s *Server) MarkStartupComplete() {
 
 // ── Accept loop ───────────────────────────────────────────────────────────────
 
+// routerForPort returns the Router bound to listenPort, or nil if the port
+// is not (or no longer) bound.
+func (s *Server) routerForPort(listenPort int) *Router {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.routers[listenPort]
+}
+
 func (s *Server) acceptLoop(pl *portListener) {
+	// Resolved once: a bound port's router does not change without an
+	// Unbind/Bind cycle (no hot-reload — ADR-0006 Non-Goals), so re-resolving
+	// per connection would only add lock contention for no benefit.
+	router := s.routerForPort(pl.binding.ListenPort)
 	for {
 		conn, err := pl.listener.Accept()
 		if err != nil {
@@ -227,11 +237,11 @@ func (s *Server) acceptLoop(pl *portListener) {
 		}
 		// Add(1) before the goroutine so CloseGraceful's Wait() always sees it.
 		s.activeConns.Add(1)
-		go s.handleConn(conn)
+		go s.handleConn(conn, router)
 	}
 }
 
-func (s *Server) handleConn(client net.Conn) {
+func (s *Server) handleConn(client net.Conn, router *Router) {
 	s.metrics.ConnStart()
 	defer func() {
 		s.metrics.ConnEnd()
@@ -239,7 +249,7 @@ func (s *Server) handleConn(client net.Conn) {
 		client.Close()
 	}()
 
-	upstream, backend, err := s.dialWithFailover()
+	upstream, backend, err := s.dialWithFailover(router)
 	if err != nil {
 		s.metrics.ConnFailed()
 		s.log.Warn("proxy: no reachable backend — dropping connection",
@@ -268,8 +278,15 @@ func (s *Server) handleConn(client net.Conn) {
 // reach this path and thus never trigger failover (WP-B2 §B2.5). Each failed
 // attempt is reported to the Runtime Registry; the Health Controller (not the
 // Traffic Engine) owns any resulting state transition.
-func (s *Server) dialWithFailover() (net.Conn, *Backend, error) {
-	candidates, err := s.router.NextCandidates(s.retry.Candidates())
+//
+// router is the Router bound to the port this connection arrived on
+// (resolved once per accepted connection in acceptLoop) — each port routes
+// through its own Router, never a single process-wide one (ADR-0006 Stage 1).
+func (s *Server) dialWithFailover(router *Router) (net.Conn, *Backend, error) {
+	if router == nil {
+		return nil, nil, fmt.Errorf("proxy: no router bound for this port")
+	}
+	candidates, err := router.NextCandidates(s.retry.Candidates())
 	if err != nil {
 		return nil, nil, err // candidate-exhaustion metric emitted by the router
 	}
@@ -295,7 +312,7 @@ func (s *Server) dialWithFailover() (net.Conn, *Backend, error) {
 			return upstream, b, nil
 		}
 		lastErr = derr
-		s.router.ReportDialFailure(b.ID)
+		router.ReportDialFailure(b.ID)
 		if !isRetryableDialError(derr) {
 			break
 		}

@@ -52,7 +52,7 @@ func newTestServer(t *testing.T) (*proxy.Registry, *proxy.Router, *proxy.Server)
 	t.Helper()
 	reg := proxy.NewRegistry()
 	router := proxy.NewRouter(reg)
-	srv := proxy.NewServer(router, nopLogger(), metrics.New())
+	srv := proxy.NewServer(nopLogger(), metrics.New())
 	t.Cleanup(srv.Close)
 	return reg, router, srv
 }
@@ -125,7 +125,7 @@ func TestServer_EndToEnd_TCPProxy(t *testing.T) {
 func TestServer_NilMetrics_DoesNotPanic(t *testing.T) {
 	reg := proxy.NewRegistry()
 	router := proxy.NewRouter(reg)
-	srv := proxy.NewServer(router, nopLogger(), nil)
+	srv := proxy.NewServer(nopLogger(), nil)
 	t.Cleanup(srv.Close)
 
 	echoAddr := echoServer(t)

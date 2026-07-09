@@ -24,8 +24,7 @@ func newAuthorityTestAPI(t *testing.T) (*state.StateManager, *httptest.Server) {
 	t.Helper()
 	m := metrics.New()
 	reg := proxy.NewRegistry()
-	router := proxy.NewRouter(reg)
-	srv := proxy.NewServer(router, zap.NewNop(), m)
+	srv := proxy.NewServer(zap.NewNop(), m)
 	t.Cleanup(srv.Close)
 
 	sm := state.NewStateManager(t.TempDir(), zap.NewNop())
@@ -150,8 +149,7 @@ func TestAuthorityEndpoints_MissingRequiredField(t *testing.T) {
 func TestAuthorityEndpoints_NilStateManagerIsNoop(t *testing.T) {
 	m := metrics.New()
 	reg := proxy.NewRegistry()
-	router := proxy.NewRouter(reg)
-	srv := proxy.NewServer(router, zap.NewNop(), m)
+	srv := proxy.NewServer(zap.NewNop(), m)
 	t.Cleanup(srv.Close)
 
 	cs := rolloutapi.NewControlServer(reg, srv, zap.NewNop(), m, "", nil)

@@ -42,13 +42,13 @@ func deadBackend(t *testing.T) string {
 	return addr
 }
 
-func newTestServer(reg *Registry) (*Server, *metrics.Proxy) {
+func newTestServer(reg *Registry) (*Server, *Router, *metrics.Proxy) {
 	m := metrics.New()
 	router := NewRouter(reg)
 	router.SetMetrics(m)
 	reg.SetMetrics(m)
-	srv := NewServer(router, zap.NewNop(), m)
-	return srv, m
+	srv := NewServer(zap.NewNop(), m)
+	return srv, router, m
 }
 
 // B2 — single healthy backend: connects, no failover.
@@ -57,8 +57,8 @@ func TestWPB2_SingleHealthyNoRetry(t *testing.T) {
 	if err := reg.Add(Backend{ID: "a", Addr: healthyBackend(t)}); err != nil {
 		t.Fatal(err)
 	}
-	srv, m := newTestServer(reg)
-	up, b, err := srv.dialWithFailover()
+	srv, router, m := newTestServer(reg)
+	up, b, err := srv.dialWithFailover(router)
 	if err != nil {
 		t.Fatalf("expected success: %v", err)
 	}
@@ -77,8 +77,8 @@ func TestWPB2_SingleDeadExhausted(t *testing.T) {
 	if err := reg.Add(Backend{ID: "a", Addr: deadBackend(t)}); err != nil {
 		t.Fatal(err)
 	}
-	srv, m := newTestServer(reg)
-	_, _, err := srv.dialWithFailover()
+	srv, router, m := newTestServer(reg)
+	_, _, err := srv.dialWithFailover(router)
 	if err == nil {
 		t.Fatal("expected exhaustion error")
 	}
@@ -100,8 +100,8 @@ func TestWPB2_TwoBackendFailover(t *testing.T) {
 	if err := reg.Add(Backend{ID: "b", Addr: healthyBackend(t)}); err != nil {
 		t.Fatal(err)
 	}
-	srv, m := newTestServer(reg)
-	up, b, err := srv.dialWithFailover()
+	srv, router, m := newTestServer(reg)
+	up, b, err := srv.dialWithFailover(router)
 	if err != nil {
 		t.Fatalf("failover should succeed: %v", err)
 	}
@@ -132,9 +132,9 @@ func TestWPB2_ThreeBackendFailover(t *testing.T) {
 	if err := reg.Add(Backend{ID: "c", Addr: healthyBackend(t)}); err != nil {
 		t.Fatal(err)
 	}
-	srv, m := newTestServer(reg)
+	srv, router, m := newTestServer(reg)
 	srv.SetRetryPolicy(RetryPolicy{MaxRetries: 2}) // primary + 2 retries = all 3
-	up, b, err := srv.dialWithFailover()
+	up, b, err := srv.dialWithFailover(router)
 	if err != nil {
 		t.Fatalf("failover should reach c: %v", err)
 	}
@@ -156,9 +156,9 @@ func TestWPB2_RetryBudgetRespected(t *testing.T) {
 	if err := reg.Add(Backend{ID: "b", Addr: healthyBackend(t)}); err != nil {
 		t.Fatal(err)
 	}
-	srv, m := newTestServer(reg)
+	srv, router, m := newTestServer(reg)
 	srv.SetRetryPolicy(RetryPolicy{MaxRetries: 0}) // no failover
-	_, _, err := srv.dialWithFailover()
+	_, _, err := srv.dialWithFailover(router)
 	if err == nil {
 		t.Fatal("with 0 retries and a dead primary, expected failure")
 	}
@@ -177,9 +177,9 @@ func TestWPB2_ExcludesNonActive(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = reg.SetState("sick", StateUnhealthy)
-	srv, _ := newTestServer(reg)
+	srv, router, _ := newTestServer(reg)
 	for i := 0; i < 10; i++ {
-		up, b, err := srv.dialWithFailover()
+		up, b, err := srv.dialWithFailover(router)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -213,13 +213,13 @@ func TestWPB2_ConcurrentFailover(t *testing.T) {
 	if err := reg.Add(Backend{ID: "b", Addr: healthyBackend(t)}); err != nil {
 		t.Fatal(err)
 	}
-	srv, _ := newTestServer(reg)
+	srv, router, _ := newTestServer(reg)
 	var wg sync.WaitGroup
 	for i := 0; i < 30; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			up, _, err := srv.dialWithFailover()
+			up, _, err := srv.dialWithFailover(router)
 			if err == nil {
 				up.Close()
 			}

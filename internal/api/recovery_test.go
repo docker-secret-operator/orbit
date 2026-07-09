@@ -21,8 +21,7 @@ func newRecoveryTestAPI(t *testing.T, token string) (*rolloutapi.ControlServer, 
 	t.Helper()
 	m := metrics.New()
 	reg := proxy.NewRegistry()
-	router := proxy.NewRouter(reg)
-	srv := proxy.NewServer(router, zap.NewNop(), m)
+	srv := proxy.NewServer(zap.NewNop(), m)
 	t.Cleanup(srv.Close)
 
 	cs := rolloutapi.NewControlServer(reg, srv, zap.NewNop(), m, token, nil)

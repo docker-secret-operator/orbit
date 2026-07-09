@@ -299,7 +299,7 @@ func runProxy(log *zap.Logger, version string) error {
 	router := proxy.NewRouter(reg)
 	reg.SetMetrics(m)
 	router.SetMetrics(m)
-	srv := proxy.NewServer(router, log, m)
+	srv := proxy.NewServer(log, m)
 
 	// Bind ports.
 	for _, binding := range cfg.Binds {

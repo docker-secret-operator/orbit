@@ -18,8 +18,7 @@ func newTestAPI(t *testing.T) (*proxy.Registry, *httptest.Server) {
 	t.Helper()
 	m := metrics.New()
 	reg := proxy.NewRegistry()
-	router := proxy.NewRouter(reg)
-	srv := proxy.NewServer(router, zap.NewNop(), m)
+	srv := proxy.NewServer(zap.NewNop(), m)
 	t.Cleanup(srv.Close)
 
 	cs := rolloutapi.NewControlServer(reg, srv, zap.NewNop(), m, "", nil)
