@@ -272,6 +272,83 @@ func (d *DockerRecoverySource) extractBackend(ctx context.Context, c types.Conta
 	}, nil
 }
 
+// VerifyBackendByID directly resolves and health-checks one specific backend
+// ID from persisted authority state (see docs/governance/AUTHORITY-LIFECYCLE.md),
+// instead of extractBackend's broad label-based scan.
+//
+// This exists because a live rollout's backend IDs
+// ("<service>-<12-char-container-id>", assigned in internal/rollout.Run) are
+// never written back to a Docker label — the orbit.io/generation label is
+// static per compose-service-definition and identical across every replica,
+// so a label-based scan can never find "the container this specific ID
+// refers to." The ID itself already contains everything needed: a direct,
+// unambiguous ContainerInspect by short-ID prefix.
+//
+// Returns an error (never panics, never guesses) for: the "<service>-default"
+// seed sentinel (not a container-ID-based ID — extractBackend's label scan
+// already handles this case correctly, since the seed's generation label
+// never changes), a malformed ID, a container that no longer exists, or one
+// that exists but fails health validation. Every error is the caller's
+// signal to fall back to the existing label-based scan, exactly as if no
+// persisted state existed.
+func (d *DockerRecoverySource) VerifyBackendByID(ctx context.Context, backendID string) (*Backend, error) {
+	prefix := d.proxyInstance + "-"
+	if !strings.HasPrefix(backendID, prefix) {
+		return nil, fmt.Errorf("backend ID %q does not belong to instance %q", backendID, d.proxyInstance)
+	}
+	shortID := strings.TrimPrefix(backendID, prefix)
+	if shortID == "default" {
+		return nil, fmt.Errorf("%q is the seed sentinel, not a container-ID-based backend — use label-based discovery", backendID)
+	}
+	if len(shortID) < 6 { // Docker's own minimum unambiguous short-ID length
+		return nil, fmt.Errorf("backend ID %q does not contain a usable container-ID suffix", backendID)
+	}
+
+	inspect, err := d.client.ContainerInspect(ctx, shortID)
+	if err != nil {
+		return nil, fmt.Errorf("container %s: %w", shortID, err)
+	}
+	if !inspect.State.Running {
+		return nil, fmt.Errorf("container %s not running (state: %s)", shortID, inspect.State.Status)
+	}
+
+	labels := inspect.Config.Labels
+	if labels["orbit.io/service"] != d.proxyInstance {
+		return nil, fmt.Errorf("container %s belongs to service %q, not %q",
+			shortID, labels["orbit.io/service"], d.proxyInstance)
+	}
+	if pi := labels["orbit.io/proxy-instance"]; pi != "" && pi != d.proxyInstance {
+		return nil, fmt.Errorf("container %s owned by instance %q, this is %q",
+			shortID, pi, d.proxyInstance)
+	}
+
+	var ip string
+	if net := inspect.NetworkSettings.Networks["docker_rollout_mesh"]; net != nil {
+		ip = net.IPAddress
+	}
+	if ip == "" {
+		return nil, fmt.Errorf("container %s not on docker_rollout_mesh network", shortID)
+	}
+
+	port := "3000" // fallback, matches extractBackend's default
+	for _, env := range inspect.Config.Env {
+		if strings.HasPrefix(env, "ORBIT_BACKEND=") {
+			if parts := strings.Split(strings.TrimPrefix(env, "ORBIT_BACKEND="), ":"); len(parts) == 2 {
+				port = parts[1]
+			}
+			break
+		}
+	}
+
+	backend := Backend{ID: backendID, Addr: net.JoinHostPort(ip, port), Generation: backendID}
+	health := d.healthValidator.CheckHealth(ctx, inspect.ID, backend)
+	if health.Status != HealthHealthy {
+		return nil, fmt.Errorf("container %s health check: %s (%s)", shortID, health.Status, health.Reason)
+	}
+
+	return &backend, nil
+}
+
 // Close closes the Docker client and health validator.
 func (d *DockerRecoverySource) Close() error {
 	if d.healthValidator != nil {

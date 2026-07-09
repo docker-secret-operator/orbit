@@ -22,7 +22,7 @@ func newTestAPI(t *testing.T) (*proxy.Registry, *httptest.Server) {
 	srv := proxy.NewServer(router, zap.NewNop(), m)
 	t.Cleanup(srv.Close)
 
-	cs := rolloutapi.NewControlServer(reg, srv, zap.NewNop(), m, "")
+	cs := rolloutapi.NewControlServer(reg, srv, zap.NewNop(), m, "", nil)
 	cs.SetStartupState(proxy.StartupReady) // tests exercise registry-based readiness, not startup gating
 	ts := httptest.NewServer(cs.Handler())
 	t.Cleanup(ts.Close)

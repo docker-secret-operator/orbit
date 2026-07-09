@@ -181,6 +181,15 @@ type ControlAPI interface {
 	RegisterBackend(ctx context.Context, opts Options, id, addr string, log *zap.Logger) error
 	DrainBackend(ctx context.Context, opts Options, id string, log *zap.Logger) error
 	DeregisterBackend(ctx context.Context, opts Options, id string, log *zap.Logger) error
+
+	// MarkTransitioning and CommitAuthority persist authority state on the
+	// proxy side — see docs/governance/AUTHORITY-LIFECYCLE.md for exactly
+	// when Run/Rollback call these and why not at other points. Failures
+	// are logged and swallowed by callers, not treated as rollout failures:
+	// a proxy that can't persist authority is no worse off than today's
+	// behavior (inferred recovery), never worse.
+	MarkTransitioning(ctx context.Context, opts Options, oldGen, newGen string, log *zap.Logger) error
+	CommitAuthority(ctx context.Context, opts Options, generation string, log *zap.Logger) error
 }
 
 // StateStore abstracts rollout state persistence for rollback support.
@@ -382,6 +391,18 @@ func runWithDeps(ctx context.Context, opts Options, log *zap.Logger, deps runDep
 		return fmt.Errorf("rollout: new backend failed stability check, rolled back automatically (old backend %s never touched): %w", nonEmptyOr(oldBackendID, "(none)"), err)
 	}
 
+	// New backend is stable and about to take over — persist that fact now,
+	// not before the stability check (nothing to correct on auto-rollback
+	// above) and not after draining (a crash between here and old-container
+	// removal needs both generations restorable). See
+	// docs/governance/AUTHORITY-LIFECYCLE.md. Best-effort: a proxy that
+	// can't persist authority is no worse off than today's always-infer
+	// behavior, so this never fails the rollout.
+	if err := deps.control.MarkTransitioning(ctx, opts, oldBackendID, newBackendID, log); err != nil {
+		log.Warn("rollout: could not persist authority transition (non-fatal, recovery will infer instead)",
+			zap.Error(err))
+	}
+
 	// ── Step 7: Drain old connections ─────────────────────────────────────
 	log.Info("rollout: draining old connections", zap.Duration("drain", opts.Drain))
 	opts.report(PhaseDraining, fmt.Sprintf("draining %s for %s", nonEmptyOr(oldBackendID, "(no prior backend)"), opts.Drain))
@@ -435,6 +456,14 @@ func runWithDeps(ctx context.Context, opts Options, log *zap.Logger, deps runDep
 			zap.Error(err))
 	} else {
 		log.Info("rollout: seed backend deregistered", zap.String("id", seedID))
+	}
+
+	// Rollout fully complete — single generation remains. Commit it as the
+	// new trusted authority and clear the in-flight RolloutState written
+	// above. Best-effort, same reasoning as MarkTransitioning.
+	if err := deps.control.CommitAuthority(ctx, opts, newBackendID, log); err != nil {
+		log.Warn("rollout: could not persist committed authority (non-fatal, recovery will infer instead)",
+			zap.Error(err))
 	}
 
 	// ── Step 10: Clear state ──────────────────────────────────────────────
@@ -625,6 +654,14 @@ func (httpControlAPI) DeregisterBackend(ctx context.Context, opts Options, id st
 	return deregisterBackend(ctx, opts, id, log)
 }
 
+func (httpControlAPI) MarkTransitioning(ctx context.Context, opts Options, oldGen, newGen string, log *zap.Logger) error {
+	return markTransitioning(ctx, opts, oldGen, newGen, log)
+}
+
+func (httpControlAPI) CommitAuthority(ctx context.Context, opts Options, generation string, log *zap.Logger) error {
+	return commitAuthority(ctx, opts, generation, log)
+}
+
 type fileStateStore struct{}
 
 func (fileStateStore) Save(state RolloutState) error { return saveState(state) }
@@ -694,9 +731,23 @@ func inspectNewestHealthy(ctx context.Context, service string) (id, addr string,
 	id = ids[0]
 	// Emit health status, "name=ip" network pairs, and "port/proto" exposed port pairs.
 	// ExposedPorts is map[Port]struct{} so we range with $k,$v to get the key.
+	//
+	// {{.State.Health.Status}} unconditionally errors out the whole `docker
+	// inspect` invocation ("map has no entry for key Health", nonzero exit)
+	// for any container with no HEALTHCHECK defined — Docker omits the
+	// field entirely rather than emitting a null. Since most real services
+	// (this codebase's own reference test stack: Grafana, Prometheus,
+	// Alertmanager, node-exporter — everything except cadvisor, which
+	// ships a HEALTHCHECK in its image) don't define one, this made every
+	// rollout/deploy against them fail every attempt until the timeout,
+	// unconditionally. {{if .State.Health}} guards the dereference; "none"
+	// is a deliberate non-empty sentinel distinct from "unhealthy"/
+	// "starting" — an empty token here would shift strings.Fields's
+	// indexing below and silently misparse the network/port tokens that
+	// follow it.
 	inspectOut, err := exec.CommandContext(ctx, "docker", "inspect",
 		"--format",
-		`{{.State.Health.Status}}{{range $n, $v := .NetworkSettings.Networks}} net={{$n}}={{$v.IPAddress}}{{end}}{{range $k, $v := .Config.ExposedPorts}} port={{$k}}{{end}}{{range .Config.Env}} env={{.}}{{end}}`,
+		`{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}{{range $n, $v := .NetworkSettings.Networks}} net={{$n}}={{$v.IPAddress}}{{end}}{{range $k, $v := .Config.ExposedPorts}} port={{$k}}{{end}}{{range .Config.Env}} env={{.}}{{end}}`,
 		id,
 	).Output()
 	if err != nil {
@@ -779,11 +830,14 @@ func verifyContainerStable(ctx context.Context, containerID string, window time.
 }
 
 // inspectHealthAndRunning returns a container's Docker healthcheck status
-// (empty string if no HEALTHCHECK is defined, mirroring inspectNewestHealthy's
-// treatment) and whether it is currently running.
+// ("none" if no HEALTHCHECK is defined, mirroring inspectNewestHealthy's
+// {{if .State.Health}} guard and non-empty sentinel — see that function's
+// comment for why the naive {{.State.Health.Status}} template errors out
+// the whole command instead of returning empty for these containers) and
+// whether it is currently running.
 func inspectHealthAndRunning(ctx context.Context, id string) (status string, running bool, err error) {
 	out, err := exec.CommandContext(ctx, "docker", "inspect",
-		"--format", `{{.State.Health.Status}}|{{.State.Running}}`,
+		"--format", `{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.State.Running}}`,
 		id,
 	).Output()
 	if err != nil {
@@ -996,6 +1050,50 @@ func deregisterBackend(ctx context.Context, opts Options, id string, log *zap.Lo
 	// 204 No Content = removed; 404 Not Found = already gone (idempotent — both are success).
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("DELETE /backends/%s: unexpected status %d", id, resp.StatusCode)
+	}
+	return nil
+}
+
+func markTransitioning(ctx context.Context, opts Options, oldGen, newGen string, log *zap.Logger) error {
+	body, _ := json.Marshal(map[string]string{"old": oldGen, "new": newGen})
+	req, err := http.NewRequestWithContext(ctx,
+		http.MethodPost, opts.ControlAddr+"/authority/transitioning", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if opts.APIToken != "" {
+		req.Header.Set("Authorization", "Bearer "+opts.APIToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST /authority/transitioning: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("POST /authority/transitioning: unexpected status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func commitAuthority(ctx context.Context, opts Options, generation string, log *zap.Logger) error {
+	body, _ := json.Marshal(map[string]string{"generation": generation})
+	req, err := http.NewRequestWithContext(ctx,
+		http.MethodPost, opts.ControlAddr+"/authority/commit", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if opts.APIToken != "" {
+		req.Header.Set("Authorization", "Bearer "+opts.APIToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST /authority/commit: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("POST /authority/commit: unexpected status %d", resp.StatusCode)
 	}
 	return nil
 }

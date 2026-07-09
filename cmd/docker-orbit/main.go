@@ -312,7 +312,8 @@ func runProxy(log *zap.Logger, version string) error {
 	sm := state.NewStateManager(cfg.StateDir, log)
 
 	// Start control API with security.
-	controlSrv := api.NewControlServer(reg, srv, log, m, cfg.APIToken)
+	controlSrv := api.NewControlServer(reg, srv, log, m, cfg.APIToken, sm)
+	controlSrv.SetTransitionTimeout(cfg.TransitionTimeout)
 
 	// Wire the debug/status data source (internal/metrics.MetricsCollector,
 	// distinct from the *metrics.Proxy connection counters above) so
@@ -517,6 +518,17 @@ func executeRecovery(
 	} else {
 		defer source.Close() //nolint:errcheck // deferred source close; error not actionable
 
+		// Trusted-authority fast path (docs/governance/AUTHORITY-LIFECYCLE.md):
+		// if persisted state names a specific backend ID, verify it directly
+		// against Docker before falling back to the broad label-based scan
+		// below — a label-based scan can never find a per-rollout backend ID
+		// (the label is static per service, identical across every replica),
+		// so without this, persisted authority would always look stale.
+		// Returns nil (never partially applies) when there's nothing to
+		// verify or verification fails, in which case the label-based scan
+		// runs exactly as it always has.
+		recoveryResult = directVerifyRecoveryResult(retryCtx, source, activeGenState, rolloutState, log)
+
 		// Discover and validate backends with health checks. A backend that
 		// hasn't opened its port yet (e.g. Grafana takes several seconds to
 		// boot, and has no Docker HEALTHCHECK to report "starting") fails a
@@ -529,7 +541,9 @@ func executeRecovery(
 			return res.HealthyCount == 0 &&
 				(res.State == proxy.StartupFailed || res.State == proxy.StartupRecovering)
 		}
-		recoveryResult, err = source.DiscoverAndValidateBackends(retryCtx)
+		if recoveryResult == nil {
+			recoveryResult, err = source.DiscoverAndValidateBackends(retryCtx)
+		}
 		for err == nil && needsRetry(recoveryResult) && retryCtx.Err() == nil {
 			select {
 			case <-time.After(time.Second):
@@ -586,6 +600,7 @@ func executeRecovery(
 			zap.String("authority", plan.AuthoritativeGeneration),
 			zap.String("reason", plan.Reason))
 
+		registeredCount := 0
 		for _, candidate := range plan.BackendsToRestore {
 			if candidate.ValidityStatus != state.CandidateValid {
 				log.Warn("recovery: skipping invalid backend candidate",
@@ -623,6 +638,7 @@ func executeRecovery(
 				zap.String("generation", candidate.Generation),
 				zap.String("traffic_role", string(candidate.TrafficRole)),
 				zap.String("reason", candidate.Reason))
+			registeredCount++
 		}
 
 		// Log recovery action details.
@@ -642,6 +658,24 @@ func executeRecovery(
 			log.Warn("recovery: inferred authority (no persistent state)",
 				zap.String("generation", plan.AuthoritativeGeneration),
 				zap.String("reason", plan.Reason))
+
+			// This branch only runs when no persisted authority existed at
+			// all (determineAuthority's Priority 1/2 both require it to be
+			// non-nil to skip inference — see AUTHORITY-LIFECYCLE.md §1.3).
+			// Persist what was just inferred so the *next* boot gets a
+			// trusted restore instead of inferring again. Same-process
+			// write (sm, not the HTTP /authority/* path a separate CLI
+			// process must use) — best-effort, never fails the recovery
+			// pass itself.
+			if registeredCount > 0 {
+				if err := sm.WriteActiveGenerationState(&state.ActiveGenerationState{
+					SchemaVersion:    state.SchemaVersion,
+					Service:          cfg.ProxyInstance,
+					ActiveGeneration: plan.AuthoritativeGeneration,
+				}, log); err != nil {
+					log.Warn("recovery: could not persist inferred authority (non-fatal)", zap.Error(err))
+				}
+			}
 
 		case state.RecoveryDegraded:
 			log.Error("recovery: degraded - no healthy generations",
@@ -686,6 +720,90 @@ func executeRecovery(
 	mc.SetCurrentState(authority, rolloutPhase, string(startupState), startupState == proxy.StartupDegraded || startupState == proxy.StartupFailed)
 
 	return startupState, plan, recoveryResult, nil
+}
+
+// directVerifyRecoveryResult attempts to resolve persisted authority
+// directly against Docker via source.VerifyBackendByID, bypassing the broad
+// label-based scan. See docs/governance/AUTHORITY-LIFECYCLE.md and
+// executeRecovery's call site for why this must run first, not as a
+// fallback. Returns nil — never a partial result — when there is nothing
+// persisted to verify or verification fails, which tells the caller to run
+// the existing label-based scan exactly as if this function didn't exist.
+func directVerifyRecoveryResult(
+	ctx context.Context,
+	source *proxy.DockerRecoverySource,
+	activeGenState *state.ActiveGenerationState,
+	rolloutState *state.RolloutState,
+	log *zap.Logger,
+) *proxy.RecoveryResult {
+	start := time.Now()
+
+	// Interrupted rollout: verify the new generation first — it's the one
+	// that must be restorable for this path to be worth anything. The old
+	// (draining) generation is opportunistic: if it doesn't verify, the new
+	// generation alone is still a valid, safe result (RecoveryRestoreSingle
+	// territory in practice, even though the persisted RolloutState still
+	// says Transitioning).
+	if rolloutState != nil && rolloutState.Authority == state.AuthorityTransitioning {
+		newBackend, err := source.VerifyBackendByID(ctx, rolloutState.NewGeneration)
+		if err != nil {
+			log.Info("recovery: direct-verify of in-flight new generation failed, falling back to label scan",
+				zap.String("id", rolloutState.NewGeneration), zap.Error(err))
+			return nil
+		}
+		backends := []proxy.BackendHealth{directVerifiedHealth(*newBackend)}
+		if rolloutState.OldGeneration != "" {
+			if oldBackend, oldErr := source.VerifyBackendByID(ctx, rolloutState.OldGeneration); oldErr == nil {
+				backends = append(backends, directVerifiedHealth(*oldBackend))
+			} else {
+				log.Info("recovery: direct-verify of in-flight old generation failed (new generation still restorable)",
+					zap.String("id", rolloutState.OldGeneration), zap.Error(oldErr))
+			}
+		}
+		log.Info("recovery: restored via direct-verify (interrupted rollout)",
+			zap.String("new", rolloutState.NewGeneration), zap.Int("verified", len(backends)))
+		return &proxy.RecoveryResult{
+			State:           proxy.StartupReady,
+			HealthyCount:    len(backends),
+			Backends:        backends,
+			TotalDiscovered: len(backends),
+			RecoveredAt:     time.Now(),
+			DurationMs:      time.Since(start).Milliseconds(),
+		}
+	}
+
+	// Steady state: one persisted, trusted generation.
+	if activeGenState != nil && activeGenState.ActiveGeneration != "" {
+		backend, err := source.VerifyBackendByID(ctx, activeGenState.ActiveGeneration)
+		if err != nil {
+			log.Info("recovery: direct-verify of persisted authority failed, falling back to label scan",
+				zap.String("id", activeGenState.ActiveGeneration), zap.Error(err))
+			return nil
+		}
+		log.Info("recovery: restored via direct-verify (trusted persisted authority)",
+			zap.String("generation", activeGenState.ActiveGeneration))
+		return &proxy.RecoveryResult{
+			State:           proxy.StartupReady,
+			HealthyCount:    1,
+			Backends:        []proxy.BackendHealth{directVerifiedHealth(*backend)},
+			TotalDiscovered: 1,
+			RecoveredAt:     time.Now(),
+			DurationMs:      time.Since(start).Milliseconds(),
+		}
+	}
+
+	return nil
+}
+
+func directVerifiedHealth(b proxy.Backend) proxy.BackendHealth {
+	return proxy.BackendHealth{
+		ID:         b.ID,
+		Addr:       b.Addr,
+		Generation: b.Generation,
+		Status:     proxy.HealthHealthy,
+		Reason:     "direct-verify against persisted authority",
+		CheckedAt:  time.Now(),
+	}
 }
 
 // countRestoredBackends reports how many of the recovery plan's candidates

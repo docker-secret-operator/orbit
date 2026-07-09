@@ -21,6 +21,7 @@ import (
 
 	"github.com/docker-secret-operator/orbit/internal/metrics"
 	"github.com/docker-secret-operator/orbit/internal/proxy"
+	"github.com/docker-secret-operator/orbit/internal/state"
 	"go.uber.org/zap"
 )
 
@@ -40,12 +41,15 @@ type ControlServer struct {
 	debug          *DebugHandler      // Nil until SetDebugHandler is called.
 	service        string             // Proxy instance identifier, for StatusReport.
 	version        string             // Runtime version, for StatusReport.
-	recoveryState                     // POST /recover trigger + in-flight guard (recovery.go)
+	sm                *state.StateManager // Authority persistence — see AUTHORITY-LIFECYCLE.md. Nil-safe: a nil sm makes the /authority/* handlers no-ops (used by tests that don't care about persistence).
+	transitionTimeout time.Duration       // Set via SetTransitionTimeout; defaults to 5m, matching config.ProxyConfig's default.
+	recoveryState                         // POST /recover trigger + in-flight guard (recovery.go)
 }
 
 // NewControlServer creates a control server backed by reg, srv, and m.
-// apiToken provides optional bearer token authentication.
-func NewControlServer(reg *proxy.Registry, srv *proxy.Server, log *zap.Logger, m *metrics.Proxy, apiToken string) *ControlServer {
+// apiToken provides optional bearer token authentication. sm may be nil —
+// see the ControlServer.sm field doc.
+func NewControlServer(reg *proxy.Registry, srv *proxy.Server, log *zap.Logger, m *metrics.Proxy, apiToken string, sm *state.StateManager) *ControlServer {
 	if apiToken == "" {
 		log.Warn("control API: unauthenticated (set ORBIT_API_TOKEN to secure)")
 	}
@@ -60,6 +64,8 @@ func NewControlServer(reg *proxy.Registry, srv *proxy.Server, log *zap.Logger, m
 		rateLimiter:  NewRateLimiter(100),
 		mux:          http.NewServeMux(),
 		startupState: proxy.StartupReady, // Caller overrides during actual proxy startup
+		sm:           sm,
+		transitionTimeout: 5 * time.Minute,
 	}
 	cs.registerRoutes()
 	return cs
@@ -74,6 +80,15 @@ func (cs *ControlServer) SetDebugHandler(dh *DebugHandler, service, version stri
 	cs.debug = dh
 	cs.service = service
 	cs.version = version
+}
+
+// SetTransitionTimeout overrides the default 5-minute deadline written into
+// RolloutState.TransitionDeadline by POST /authority/transitioning. Should
+// match the proxy's own ORBIT_TRANSITION_TIMEOUT so a future recovery pass's
+// staleness check (internal/state.IsTransitionStale) agrees with the value
+// that was actually in effect when the transition began.
+func (cs *ControlServer) SetTransitionTimeout(d time.Duration) {
+	cs.transitionTimeout = d
 }
 
 // SetStartupState sets the current startup state (called after recovery completes).
@@ -141,6 +156,11 @@ func (cs *ControlServer) registerRoutes() {
 	// On-demand recovery trigger — mutates the registry, auth-protected like
 	// backend management.
 	cs.mux.HandleFunc("/recover", cs.auth(cs.handleRecover))
+
+	// Authority persistence (see docs/governance/AUTHORITY-LIFECYCLE.md) —
+	// mutates state, auth-protected like backend management.
+	cs.mux.HandleFunc("/authority/transitioning", cs.auth(cs.handleAuthorityTransitioning))
+	cs.mux.HandleFunc("/authority/commit", cs.auth(cs.handleAuthorityCommit))
 }
 
 // GET /status — consolidated deployment/proxy/recovery status. Backing for

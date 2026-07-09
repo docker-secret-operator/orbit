@@ -250,3 +250,38 @@ func TestNewHealthValidatorWithConfig(t *testing.T) {
 
 	hv.Close()
 }
+
+// TestVerifyBackendByID_FailsClosed exercises VerifyBackendByID's
+// validation branches — the ones that must reject before ever touching
+// Docker, since a real *client.Client isn't constructible in a unit test.
+// This is exactly the safety property docs/governance/AUTHORITY-LIFECYCLE.md
+// depends on: an ID that doesn't unambiguously resolve must error, never
+// guess. d.client/d.healthValidator staying nil for these cases is itself
+// part of the assertion — if any of them reached that far, this test would
+// panic instead of returning a clean error.
+func TestVerifyBackendByID_FailsClosed(t *testing.T) {
+	d := &DockerRecoverySource{proxyInstance: "web", log: zap.NewNop()}
+
+	cases := []struct {
+		name      string
+		backendID string
+	}{
+		{"wrong service prefix", "prometheus-a1b2c3d4e5f6"},
+		{"no prefix at all", "a1b2c3d4e5f6"},
+		{"seed sentinel", "web-default"},
+		{"too-short suffix", "web-a1b2"},
+		{"empty", ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			backend, err := d.VerifyBackendByID(context.Background(), tc.backendID)
+			if err == nil {
+				t.Fatalf("VerifyBackendByID(%q) = %+v, nil; want an error", tc.backendID, backend)
+			}
+			if backend != nil {
+				t.Errorf("VerifyBackendByID(%q) backend = %+v, want nil on error", tc.backendID, backend)
+			}
+		})
+	}
+}
