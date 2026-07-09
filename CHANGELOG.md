@@ -8,6 +8,18 @@ No version has been tagged yet. Everything below is `[Unreleased]`.
 
 ## [Unreleased]
 
+### Added — Trusted authority persistence, not just inference (Phase 2.5)
+
+`internal/state.WriteActiveGenerationState`/`WriteRolloutState` were previously called only from chaos test scenarios — never from any production code path, at proxy startup or during a live rollout. `RecoveryRestoreSingle` and `RecoveryRestoreWithDraining` were fully implemented and unit-tested but had never fired outside a test; every recovery in this project's history, without exception, was `RecoveryInferredFallback`. Root cause documented before any code changed: see [docs/governance/AUTHORITY-LIFECYCLE.md](docs/governance/AUTHORITY-LIFECYCLE.md) — a live rollout's backend IDs are never written to a Docker label, and the label recovery reads is static per compose-service-definition, so persisting either naively is useless. Closing this needed a second way for recovery to resolve a specific persisted ID, not just a place to write one:
+
+- New `POST /authority/transitioning` / `POST /authority/commit` control-API endpoints, called by `internal/rollout.Run` after the stability check passes and after the old backend is fully removed, respectively.
+- New `internal/proxy.DockerRecoverySource.VerifyBackendByID`: resolves one specific persisted backend ID by direct `ContainerInspect` on its embedded container-ID prefix, since the broad label-based scan structurally cannot find a per-rollout ID. Fails closed to the existing label-based scan for the seed sentinel, malformed IDs, missing containers, or failed health checks.
+- `executeRecovery` tries direct-verify first when persisted state exists, and persists the seed's authority on the first successful `RecoveryInferredFallback` so the *second* boot gets a trusted restore too.
+
+**Two more rollout-blocking bugs found while live-verifying this end-to-end:** a fixed `container_name` on a service (set by the original `docker-compose.yml`, preserved verbatim by the generator) makes `docker compose up --scale` refuse to run at all — fixed by stripping it from the generated backing service, since any proxied service will be scaled during its first rollout. Separately, `docker inspect --format '{{.State.Health.Status}}'` (used by both the rollout health-check and stability-check steps) unconditionally errors the whole command for any container without a Docker `HEALTHCHECK` — which is most real services, including everything in the reference test stack except cadvisor — making rollout fail its health check and auto-rollback its stability check on every attempt, independent of anything else in this change. Both fixed with `{{if .State.Health}}` guards.
+
+Verified end-to-end, not just unit tests: a real `docker orbit rollout grafana` — the first one to complete in this project's history against the reference stack — persisted a per-rollout backend ID with correctly CAS-chained revisions; a subsequent proxy restart restored via `action=restore_single, authority_transitions=0` instead of inferring, confirmed via the proxy's own logs and `/status`, with traffic (`HTTP 200`) unaffected throughout.
+
 ### Fixed — Cold-start reliability (Phase 3.2)
 
 A live redeploy of a real 6-service Compose stack — the most basic possible workflow, `docker orbit generate` then `docker compose up`, no rollout ever run — surfaced nine real defects across two sessions, all concentrated in the same place: the per-service proxy's discovery/recovery path. See [ADR-0006](docs/adr/ADR-0006-shared-proxy-and-event-driven-discovery.md) for the architecture decision this exercise produced.

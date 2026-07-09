@@ -1,6 +1,6 @@
 # Authority Lifecycle — Current State, Gap, and Design
 
-**Status:** Design, pre-implementation. Written before any code changes per this phase's own working rule: "Implement only after the lifecycle is fully understood."
+**Status:** Implemented (2026-07-09) for the forward-rollout path (`internal/rollout.Run`). Live-verified end-to-end against the reference test stack: a real rollout persisted a per-rollout backend ID, and a subsequent proxy restart restored via direct-verify (`RecoveryRestoreSingle`, `authority_transitions: 0`) instead of inferring. `internal/rollout.Rollback` does not yet call `CommitAuthority` on its own completion — see the implementing commit's "Remaining work" note.
 
 **Companion to:** [STATE.md](STATE.md) (what's persisted and why), [ADR-0003](../adr/ADR-0003-deployment-engine-architecture.md) (the recovery model this lifecycle feeds).
 
