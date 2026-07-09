@@ -8,6 +8,31 @@ No version has been tagged yet. Everything below is `[Unreleased]`.
 
 ## [Unreleased]
 
+### Fixed — Cold-start reliability (Phase 3.2)
+
+A live redeploy of a real 6-service Compose stack — the most basic possible workflow, `docker orbit generate` then `docker compose up`, no rollout ever run — surfaced nine real defects across two sessions, all concentrated in the same place: the per-service proxy's discovery/recovery path. See [ADR-0006](docs/adr/ADR-0006-shared-proxy-and-event-driven-discovery.md) for the architecture decision this exercise produced.
+
+**First-deploy backend registration (five bugs, one session):**
+- Generated proxy services never mounted `/var/run/docker.sock` — the proxy couldn't reach the Docker daemon at all.
+- Generated backing services were missing the `orbit.io/generation`/`orbit.io/proxy` labels and `ORBIT_BACKEND_ID` env `internal/proxy.DockerRecoverySource.extractBackend` requires — every container looked "incomplete" and was skipped.
+- The `docker_rollout_mesh` network wasn't pinned with `name:`, so Compose project-prefixed it and recovery's exact-match network lookup never found a container's IP.
+- Proxies had no per-service instance scoping (`ORBIT_PROXY_INSTANCE` / `orbit.io/proxy-instance`), so every proxy discovered every other service's backends too, and could adopt one as its own authoritative generation.
+- `internal/state.GenerateRecoveryPlan`'s backend-selection phase filtered candidates by the pre-inference `authority` variable instead of `plan.AuthoritativeGeneration`, so the inferred-fallback cold-start path (no persisted state yet) always produced zero restorable candidates even after correctly inferring an authority.
+
+**Startup and recovery reliability (four bugs, second session):**
+- Startup recovery gave up after a single failed TCP dial instead of using its own `ORBIT_STARTUP_TIMEOUT` budget; any backend slower than one dial timeout to open its port (Grafana, cadvisor) read as permanently `failed`. Fixed with a bounded retry loop covering both `StartupFailed` and `StartupRecovering` (a backend with its own Docker `HEALTHCHECK` reporting "starting" was just as stuck).
+- The same one-shot-no-retry gap existed one level up, in connecting to the Docker daemon itself — extended the same retry budget to cover daemon reconnects.
+- `ProxyConfig.StateDir` (`/var/lib/orbit`) was never mounted as a volume, so `ActiveGenerationState`/`RolloutState` were lost on every container recreation. Fixed with one named volume per proxied service. **Found in the process:** `WriteActiveGenerationState`/`WriteRolloutState` are only ever called from chaos test scenarios, never from any live code path — the volume mount makes persistence durable *if* something writes to it, but nothing does yet. Tracked as a follow-up; not fixed in this pass because doing so incompletely (persisting only at boot, not also when a live rollout hands off authority) would introduce a stale-authority regression worse than today's always-infer behavior.
+- `internal/proxy.HealthController` only re-checks backends already in its registry (by its own documented Layer 5 contract, it must never touch Docker lifecycle) — a service that never got past initial recovery, or one whose only backend later crashed, had nothing left to bring it back except a human running `docker orbit recover`. Added a periodic rediscovery pass, gated to only run when a service has zero active backends. Verified live: a proxy stuck at `proxy_status: failed` self-healed to `ready` within one tick of its backend coming back, no CLI command run.
+
+### Removed — `internal/stack` duplicate execution layer (ADR-0005 stage 2)
+
+Not a deletion of the package — [ADR-0005](docs/adr/ADR-0005-multi-service-orchestration-architecture.md) explicitly freezes `internal/stack` as a future v2 subsystem and its dependency-graph engine is real, needed, and unchanged. This executed three of the four items already listed in that ADR's own migration plan: removed `docker_integration.go` (a duplicate deployment engine whose every method was an unconditional placeholder — e.g. `CreateContainer` returned a fabricated `mock-<name>-<timestamp>` ID without touching Docker), `docker_client.go`'s `RealDockerClient` and all of `docker_sdk_client.go` (same placeholder pattern, SDK-flavored — `MockDockerClient` and the `DockerClient` interface are unchanged and still back `docker_transaction.go`/`health_monitor.go`), and `state_persistence.go` (a duplicate WAL nothing else referenced). `internal/stack`: 4,149 → 2,822 non-test LOC, and it no longer imports `github.com/docker/docker` at all, narrowing `docs/governance/SECURITY.md`'s `docker@v24` CVE note.
+
+### Fixed — `docker orbit` display-text consistency and install UX
+
+The CLI's own `--help` output, and several error hints, still said `docker-orbit` (the binary name) in places, while `deploy`/`doctor`/`history`/`status` already correctly said `docker orbit` (how it's actually invoked as a Docker CLI plugin). Root command now uses cobra's `CommandDisplayNameAnnotation` so `--help` renders correctly without changing what Cobra dispatches on internally; `docs/cli-reference/` generation strips the annotation so those file names stay on their existing hyphenated convention. Separately, `make install-plugin` no longer re-runs the full build under `sudo` — only the final copy escalates, and only when the target directory isn't writable, so a plain `go build`'s module cache stays owned by the invoking user instead of root.
+
 ### Added — Native distribution & release pipeline (Phase 3.1)
 
 Orbit can now be installed as a native Docker CLI plugin without Go, a source checkout, or a container wrapper. Full guide: [docs/installation.md](docs/installation.md).
