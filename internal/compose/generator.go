@@ -51,6 +51,10 @@ func Generate(input *ComposeFile) (*ComposeFile, *Summary, error) {
 	}
 	out.Networks["docker_rollout_mesh"] = map[string]interface{}{"driver": "bridge", "name": "docker_rollout_mesh"}
 
+	if out.Volumes == nil {
+		out.Volumes = make(map[string]interface{})
+	}
+
 	sum := &Summary{}
 
 	for name, svc := range input.Services {
@@ -79,6 +83,12 @@ func Generate(input *ComposeFile) (*ComposeFile, *Summary, error) {
 			out.Services[name] = backing
 			out.Services["docker-rollout-proxy-"+name] = proxy
 			sum.Proxied = append(sum.Proxied, name)
+
+			// Named volume for the proxy's ORBIT_STATE_DIR (/var/lib/orbit) —
+			// see buildProxyPair's volume mount. Declared here, not in
+			// buildProxyPair, because top-level `volumes:` entries live on
+			// ComposeFile, not Service.
+			out.Volumes[stateVolumeName(name)] = nil
 		}
 	}
 
@@ -221,7 +231,18 @@ func buildProxyPair(name string, svc Service) (backing Service, proxy Service, e
 			// the proxy lists and inspects Orbit-managed containers by label to
 			// discover and validate backends. Read-only — it never creates,
 			// starts, or removes containers from inside the proxy.
-			"volumes": toRawSlice([]string{"/var/run/docker.sock:/var/run/docker.sock:ro"}),
+			//
+			// The second mount backs ORBIT_STATE_DIR (default /var/lib/orbit):
+			// without it, ActiveGenerationState/RolloutState live only in the
+			// container's writable layer and are lost on every recreation
+			// (docker compose up after any change, --force-recreate, a host
+			// reboot) — GenerateRecoveryPlan's persisted-state fast path
+			// (RecoveryRestoreSingle) then never has anything to restore from
+			// and every recovery silently falls back to RecoveryInferredFallback.
+			"volumes": toRawSlice([]string{
+				"/var/run/docker.sock:/var/run/docker.sock:ro",
+				stateVolumeName(name) + ":/var/lib/orbit",
+			}),
 		},
 	}
 
@@ -309,6 +330,13 @@ func copyStrMap(m map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// stateVolumeName returns the named volume backing a proxied service's
+// ORBIT_STATE_DIR. One volume per service, matching the one-proxy-per-service
+// model: each proxy only ever writes files for its own service name.
+func stateVolumeName(service string) string {
+	return "docker_rollout_state_" + service
 }
 
 // toRawSlice converts []string to []interface{} for storage in RawFields.
