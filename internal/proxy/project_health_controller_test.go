@@ -5,6 +5,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // countingProber scripts health per-address and counts probes per-address,
@@ -185,4 +189,71 @@ func TestProjectHealthController_Run(t *testing.T) {
 	}
 	wg.Wait()
 	cancel()
+}
+
+// TestProjectHealthController_LogsCarryServiceField is the Stage 2.4 test:
+// HealthController's own "health: backend transitioned" log line is emitted
+// unmodified (no HealthController code changed for this stage), but the
+// *zap.Logger ProjectHealthController hands it must be pre-scoped with a
+// service field, so the resulting log entry is attributable without an
+// operator having to cross-reference which HealthController instance
+// produced it. Two services are evaluated; each one's transition log must
+// carry its own service name, never the other's.
+func TestProjectHealthController_LogsCarryServiceField(t *testing.T) {
+	regWeb := NewRegistry()
+	addBackend(t, regWeb, "web-b1")
+	if err := regWeb.Add(Backend{ID: "web-keep", Addr: "10.9.9.1:80"}); err != nil {
+		t.Fatal(err)
+	}
+	regAPI := NewRegistry()
+	addBackend(t, regAPI, "api-b1")
+	if err := regAPI.Add(Backend{ID: "api-keep", Addr: "10.9.9.2:80"}); err != nil {
+		t.Fatal(err)
+	}
+
+	pr := NewProjectRegistry()
+	pr.Register("web", regWeb)
+	pr.Register("api", regAPI)
+
+	prober := newCountingProber()
+	prober.set("10.0.0.1:80", false) // both web-b1 and api-b1 share this addr from addBackend — both fail identically
+
+	core, observed := observer.New(zapcore.InfoLevel)
+	log := zap.New(core)
+	phc := NewProjectHealthController(pr, prober, phcFastCfg(), nil, log)
+	ctx := context.Background()
+
+	phc.CheckOnce(ctx) // fail 1 — still active
+	phc.CheckOnce(ctx) // fail 2 — both demote, both should log a transition
+
+	var webTagged, apiTagged, untagged int
+	for _, entry := range observed.All() {
+		if entry.Message != "health: backend transitioned" {
+			continue
+		}
+		fields := entry.ContextMap()
+		svc, ok := fields["service"]
+		if !ok {
+			untagged++
+			continue
+		}
+		switch svc {
+		case "web":
+			webTagged++
+		case "api":
+			apiTagged++
+		default:
+			t.Fatalf("unexpected service field value %q", svc)
+		}
+	}
+
+	if untagged != 0 {
+		t.Errorf("every transition log must carry a service field, got %d without one", untagged)
+	}
+	if webTagged == 0 {
+		t.Error("expected at least one transition log tagged service=web")
+	}
+	if apiTagged == 0 {
+		t.Error("expected at least one transition log tagged service=api")
+	}
 }

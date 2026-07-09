@@ -234,3 +234,64 @@ func TestExecuteRecoveryForProject_ConcurrentServiceRemoval(t *testing.T) {
 
 	wg.Wait()
 }
+
+// TestExecuteRecoveryForProject_LogsCarryServiceField is the Stage 2.4 test:
+// executeRecovery's own log call sites are unmodified (no executeRecovery
+// logging line was touched for this stage) — the field appears because
+// executeRecoveryForProject hands each iteration a *zap.Logger pre-scoped
+// with that service's name via log.With, so every entry executeRecovery
+// itself emits is attributable without cross-referencing which pass
+// produced it. Every entry must carry a service field naming one of the two
+// configured services; the corruption-specific warning must name the
+// broken one specifically, never the healthy one.
+func TestExecuteRecoveryForProject_LogsCarryServiceField(t *testing.T) {
+	tmpDir := t.TempDir()
+	sm := state.NewStateManager(tmpDir, nil)
+	writeCorruptedActiveGenState(t, sm, "aaa-broken")
+
+	pr := proxy.NewProjectRegistry()
+	pr.Register("aaa-broken", proxy.NewRegistry())
+	pr.Register("zzz-healthy", proxy.NewRegistry())
+
+	core, observed := observer.New(zapcore.InfoLevel)
+	log := zap.New(core)
+	cfg := testCfg()
+	mc := metrics.NewMetricsCollector()
+	debugHandler := api.NewDebugHandler(sm, mc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	executeRecoveryForProject(ctx, cfg, sm, pr, mc, debugHandler, log)
+
+	if len(observed.All()) == 0 {
+		t.Fatal("expected at least some log output from the recovery pass")
+	}
+
+	seenServices := map[string]bool{}
+	corruptionServiceSeen := ""
+	for _, entry := range observed.All() {
+		fields := entry.ContextMap()
+		svc, ok := fields["service"]
+		if !ok {
+			t.Fatalf("log entry %q has no service field: %v", entry.Message, fields)
+		}
+		svcStr, _ := svc.(string)
+		if svcStr != "aaa-broken" && svcStr != "zzz-healthy" {
+			t.Fatalf("log entry %q has unexpected service field %q", entry.Message, svcStr)
+		}
+		seenServices[svcStr] = true
+
+		if strings.Contains(strings.ToLower(entry.Message), "active generation") &&
+			strings.Contains(strings.ToLower(entry.Message), "unreadable") {
+			corruptionServiceSeen = svcStr
+		}
+	}
+
+	if !seenServices["aaa-broken"] || !seenServices["zzz-healthy"] {
+		t.Fatalf("expected log output attributed to both services, got %v", seenServices)
+	}
+	if corruptionServiceSeen != "aaa-broken" {
+		t.Fatalf("corruption warning must be attributed to aaa-broken specifically, got %q", corruptionServiceSeen)
+	}
+}

@@ -106,9 +106,20 @@ func (p *ProjectHealthController) CheckOnce(ctx context.Context) {
 func (p *ProjectHealthController) healthControllerFor(service string, reg *Registry) *HealthController {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// hc.reg (unexported) is compared directly rather than through an
+	// accessor — legal within this package, but it means this function
+	// depends on HealthController's internal field layout, not just its
+	// exported Run/CheckOnce contract. A future HealthController refactor
+	// that renames or restructures this field must keep this comparison in
+	// mind (ADR-0006 governance review 01, §5/§12).
 	hc, ok := p.byService[service]
 	if !ok || hc.reg != reg {
-		hc = NewHealthController(reg, p.prober, p.cfg, p.metrics, p.log)
+		// A logger scoped with the service name, not the raw p.log, so
+		// every log line HealthController.CheckOnce already emits (e.g.
+		// "health: backend transitioned") is attributable to this service
+		// with zero changes to HealthController itself — logging remains a
+		// presentation concern, injected here rather than added there.
+		hc = NewHealthController(reg, p.prober, p.cfg, p.metrics, p.log.With(zap.String("service", service)))
 		p.byService[service] = hc
 	}
 	return hc

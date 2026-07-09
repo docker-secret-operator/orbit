@@ -821,7 +821,15 @@ func executeRecoveryForProject(
 		if !ok {
 			continue
 		}
-		st, plan, result, err := executeRecovery(ctx, cfg, sm, reg, service, mc, debugHandler, log)
+		// Scoped once per service and reused for this entire recovery pass
+		// (Stage 2.4) — every log line executeRecovery already emits (plan
+		// generated, backend registered, health state, discovery retries,
+		// inferred-authority persistence, ...) is now attributable to this
+		// service with zero changes to executeRecovery's own log call
+		// sites: the field rides along on every call made through this
+		// logger, not because each statement was individually edited.
+		serviceLog := log.With(zap.String("service", service))
+		st, plan, result, err := executeRecovery(ctx, cfg, sm, reg, service, mc, debugHandler, serviceLog)
 		results[service] = serviceRecoveryOutcome{State: st, Plan: plan, Result: result, Err: err}
 		// Deliberately no early return/break on err or a failed state — one
 		// service's outcome must never prevent the remaining services from
