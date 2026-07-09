@@ -52,6 +52,7 @@ type Server struct {
 
 	mu          sync.RWMutex
 	listeners   map[int]*portListener // real listen port → listener
+	routers     map[int]*Router       // real listen port → router (ADR-0006 Stage 1; not yet consulted)
 	activeConns sync.WaitGroup        // tracks in-flight connections for graceful drain
 
 	retry RetryPolicy // passive-failover retry policy (WP-B2)
@@ -70,6 +71,7 @@ func NewServer(router *Router, log *zap.Logger, m *metrics.Proxy) *Server {
 		log:       log,
 		metrics:   m,
 		listeners: make(map[int]*portListener),
+		routers:   make(map[int]*Router),
 		retry:     DefaultRetryPolicy(),
 	}
 }
