@@ -1,6 +1,7 @@
 package rollout
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,6 +23,7 @@ type fakeControlServer struct {
 	register func(id, addr string) int // status code to return; 0 = default 201
 	drain    func(id string) int       // 0 = default 204
 	delete   func(id string) int       // 0 = default 204
+	commits  []string                  // generation values POSTed to /authority/commit
 }
 
 func newFakeControlServer(t *testing.T) (*httptest.Server, *fakeControlServer) {
@@ -63,6 +65,17 @@ func newFakeControlServer(t *testing.T) (*httptest.Server, *fakeControlServer) {
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
+	})
+	mux.HandleFunc("/authority/commit", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Generation string `json:"generation"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fc.mu.Lock()
+		fc.calls = append(fc.calls, "POST /authority/commit")
+		fc.commits = append(fc.commits, body.Generation)
+		fc.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -110,9 +123,11 @@ func TestRollback_Success_RestoresDrainsDeregisters(t *testing.T) {
 		"POST /backends",
 		"PUT /backends/web-new-xyz/drain",
 		"DELETE /backends/web-new-xyz",
+		"POST /authority/commit",
 	}
 	fc.mu.Lock()
 	gotCalls := append([]string(nil), fc.calls...)
+	gotCommits := append([]string(nil), fc.commits...)
 	fc.mu.Unlock()
 	if len(gotCalls) != len(wantCalls) {
 		t.Fatalf("calls = %v, want %v", gotCalls, wantCalls)
@@ -121,6 +136,9 @@ func TestRollback_Success_RestoresDrainsDeregisters(t *testing.T) {
 		if gotCalls[i] != wantCalls[i] {
 			t.Errorf("call[%d] = %q, want %q", i, gotCalls[i], wantCalls[i])
 		}
+	}
+	if len(gotCommits) != 1 || gotCommits[0] != "web-old-abc" {
+		t.Errorf("authority commit = %v, want [web-old-abc] (rollback must commit the restored, old backend as authority)", gotCommits)
 	}
 
 	wantPhases := []RollbackPhase{RollbackPhaseRestoring, RollbackPhaseDraining, RollbackPhaseDeregistering, RollbackPhaseComplete}
@@ -175,8 +193,14 @@ func TestRollback_NoNewBackendRecorded_SkipsDrainAndDeregister(t *testing.T) {
 	fc.mu.Lock()
 	gotCalls := append([]string(nil), fc.calls...)
 	fc.mu.Unlock()
-	if len(gotCalls) != 1 || gotCalls[0] != "POST /backends" {
-		t.Errorf("calls = %v, want only POST /backends (no new backend to drain/remove)", gotCalls)
+	wantCalls := []string{"POST /backends", "POST /authority/commit"}
+	if len(gotCalls) != len(wantCalls) {
+		t.Fatalf("calls = %v, want %v (no new backend to drain/remove, but authority is still committed)", gotCalls, wantCalls)
+	}
+	for i := range wantCalls {
+		if gotCalls[i] != wantCalls[i] {
+			t.Errorf("call[%d] = %q, want %q", i, gotCalls[i], wantCalls[i])
+		}
 	}
 
 	wantPhases := []RollbackPhase{RollbackPhaseRestoring, RollbackPhaseComplete}

@@ -595,6 +595,18 @@ func Rollback(ctx context.Context, state RolloutState, log *zap.Logger, progress
 		}
 	}
 
+	// Rollback is just as much a completed authority transition as a
+	// forward rollout — the old backend is what's serving traffic now, and
+	// the persisted authority must say so, or a proxy restart after a
+	// rollback restores from a stale post-rollout-attempt value instead of
+	// the generation actually running. Best-effort, same reasoning as
+	// Run's MarkTransitioning/CommitAuthority: a failed persist never fails
+	// the rollback itself.
+	if err := commitAuthority(ctx, opts, state.OldBackendID, log); err != nil {
+		log.Warn("rollback: could not persist restored authority (non-fatal, recovery will infer instead)",
+			zap.Error(err))
+	}
+
 	clearState(state.Service)
 	log.Info("rollback: complete", zap.String("service", state.Service))
 	report(RollbackPhaseComplete, state.Service+" restored to "+state.OldBackendID)
