@@ -394,6 +394,36 @@ func runProxy(log *zap.Logger, version string) error {
 		log.Info("runtime: continuous health controller activated via feature gate")
 	}
 
+	// Periodic rediscovery. HealthController (above) only re-checks backends
+	// already in the registry — by its own Layer 5 contract it must never
+	// touch Docker lifecycle — so a service that never got past initial
+	// recovery (slower than the startup budget) or one whose only backend
+	// later crashes has nothing left to bring it back except a manual
+	// `docker orbit recover`. Reuses the same executeRecovery pass this
+	// file's SetRecoveryTrigger already calls on demand, on a slower ticker,
+	// only when the registry is actually empty of active backends.
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if len(reg.Active()) > 0 {
+					continue
+				}
+				log.Info("runtime: zero active backends, attempting rediscovery")
+				startupState, _, _, err := executeRecovery(ctx, cfg, sm, reg, mc, debugHandler, log)
+				if err != nil {
+					log.Warn("runtime: rediscovery attempt failed", zap.Error(err))
+					continue
+				}
+				controlSrv.SetStartupState(startupState)
+			}
+		}
+	}()
+
 	<-ctx.Done()
 
 	log.Info("proxy: shutdown signal received")
