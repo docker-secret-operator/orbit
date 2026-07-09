@@ -347,28 +347,27 @@ func runProxy(log *zap.Logger, version string) error {
 	// orbit recover` is available the moment the control API starts
 	// listening, not only after startup recovery finishes.
 	controlSrv.SetRecoveryTrigger(func(ctx context.Context) (api.RecoveryOutcome, error) {
-		startupState, plan, _, err := executeRecovery(ctx, cfg, sm, reg, cfg.ProxyInstance, mc, debugHandler, log)
-		if err != nil {
-			return api.RecoveryOutcome{}, err
+		// ADR-0006 Stage 3.4: executeRecoveryForProject orchestrates — it
+		// loops over pr.Services() (today: exactly cfg.ProxyInstance) and
+		// calls the unmodified executeRecovery once per service. Indexing
+		// the result map by cfg.ProxyInstance is the direct, minimal
+		// translation of "there is exactly one service" into this map
+		// shape — not a new aggregation policy. A true multi-service
+		// RecoveryOutcome shape is later work (this stage does not modify
+		// ControlServer or api.RecoveryOutcome).
+		results := executeRecoveryForProject(ctx, cfg, sm, pr, mc, debugHandler, log)
+		result := results[cfg.ProxyInstance]
+		if result.Err != nil {
+			return api.RecoveryOutcome{}, result.Err
 		}
-		outcome := api.RecoveryOutcome{
-			Timestamp:   time.Now().UTC(),
-			ProxyStatus: string(startupState),
-		}
-		if plan != nil {
-			outcome.Epoch = plan.Epoch
-			outcome.Action = string(plan.Action)
-			outcome.AuthoritativeGeneration = plan.AuthoritativeGeneration
-			outcome.Reason = plan.Reason
-			outcome.FailedReason = plan.FailedReason
-			outcome.BackendsRestored = countRestoredBackends(plan)
-		}
-		controlSrv.SetStartupState(startupState)
+		outcome := recoveryOutcomeFor(result)
+		controlSrv.SetStartupState(result.State)
 		return outcome, nil
 	})
 
 	recoveryCtx, cancel := context.WithTimeout(context.Background(), cfg.StartupTimeout)
-	startupState, _, _, _ := executeRecovery(recoveryCtx, cfg, sm, reg, cfg.ProxyInstance, mc, debugHandler, log)
+	startupResults := executeRecoveryForProject(recoveryCtx, cfg, sm, pr, mc, debugHandler, log)
+	startupState := startupResults[cfg.ProxyInstance].State
 	cancel()
 
 	// Set control server startup state for readiness endpoint.
@@ -434,12 +433,13 @@ func runProxy(log *zap.Logger, version string) error {
 					continue
 				}
 				log.Info("runtime: zero active backends, attempting rediscovery")
-				startupState, _, _, err := executeRecovery(ctx, cfg, sm, reg, cfg.ProxyInstance, mc, debugHandler, log)
-				if err != nil {
-					log.Warn("runtime: rediscovery attempt failed", zap.Error(err))
+				results := executeRecoveryForProject(ctx, cfg, sm, pr, mc, debugHandler, log)
+				result := results[cfg.ProxyInstance]
+				if result.Err != nil {
+					log.Warn("runtime: rediscovery attempt failed", zap.Error(result.Err))
 					continue
 				}
-				controlSrv.SetStartupState(startupState)
+				controlSrv.SetStartupState(result.State)
 			}
 		}
 	}()
@@ -866,6 +866,29 @@ func executeRecoveryForProject(
 		// getting their own recovery attempt.
 	}
 	return results
+}
+
+// recoveryOutcomeFor translates one service's serviceRecoveryOutcome (from
+// executeRecoveryForProject's result map) into the api.RecoveryOutcome shape
+// POST /recover returns. ADR-0006 Stage 3.4 — extracted out of runProxy's
+// SetRecoveryTrigger closure, which cannot be unit-tested directly, so this
+// translation is: it reshapes already-computed values (epoch, action,
+// authority, reason, backend count) without recomputing or reinterpreting
+// any of them — no recovery logic lives here.
+func recoveryOutcomeFor(result serviceRecoveryOutcome) api.RecoveryOutcome {
+	outcome := api.RecoveryOutcome{
+		Timestamp:   time.Now().UTC(),
+		ProxyStatus: string(result.State),
+	}
+	if result.Plan != nil {
+		outcome.Epoch = result.Plan.Epoch
+		outcome.Action = string(result.Plan.Action)
+		outcome.AuthoritativeGeneration = result.Plan.AuthoritativeGeneration
+		outcome.Reason = result.Plan.Reason
+		outcome.FailedReason = result.Plan.FailedReason
+		outcome.BackendsRestored = countRestoredBackends(result.Plan)
+	}
+	return outcome
 }
 
 // directVerifyRecoveryResult attempts to resolve persisted authority
