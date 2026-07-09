@@ -302,6 +302,16 @@ func runProxy(log *zap.Logger, version string) error {
 	router.SetMetrics(m)
 	srv := proxy.NewServer(log, m)
 
+	// ADR-0006 Stage 3.1: make a ProjectRegistry exist in the running
+	// process, registering today's one Registry under cfg.ProxyInstance.
+	// Dependency injection only — nothing below this line consumes pr yet.
+	// reg remains what every existing call site in this function uses;
+	// pr is a second, passive reference to the exact same *Registry, not a
+	// second registry. Consuming it (starting with ControlServer) is
+	// Stage 3.2's job, not this one's.
+	pr := newProjectRegistryForService(cfg.ProxyInstance, reg)
+	_ = pr // not consumed yet — see Stage 3.2
+
 	// Bind ports.
 	for _, binding := range cfg.Binds {
 		if err := srv.Bind(proxy.PortBinding{ListenPort: binding.ListenPort, TargetPort: binding.TargetPort}, router); err != nil {
@@ -440,6 +450,19 @@ func runProxy(log *zap.Logger, version string) error {
 
 	log.Info("proxy: shutdown complete")
 	return nil
+}
+
+// newProjectRegistryForService constructs a ProjectRegistry containing
+// exactly one registered service: name → reg. ADR-0006 Stage 3.1 —
+// dependency injection only, extracted out of runProxy (which cannot be
+// unit-tested directly: it binds real ports, starts an HTTP server, and
+// blocks on a shutdown signal) so this specific piece of wiring — and only
+// this piece — is independently testable without touching anything else
+// runProxy does.
+func newProjectRegistryForService(name string, reg *proxy.Registry) *proxy.ProjectRegistry {
+	pr := proxy.NewProjectRegistry()
+	pr.Register(name, reg)
+	return pr
 }
 
 // executeRecovery performs one real recovery pass for service: load
