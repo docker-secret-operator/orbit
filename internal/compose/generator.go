@@ -40,11 +40,16 @@ func Generate(input *ComposeFile) (*ComposeFile, *Summary, error) {
 		Volumes:  deepCopyMap(input.Volumes),
 	}
 
-	// Ensure the mesh network exists.
+	// Ensure the mesh network exists. name: pins the actual Docker network
+	// name to "docker_rollout_mesh" regardless of Compose project — without
+	// it Compose prefixes the network with the project name (e.g.
+	// "myproject_docker_rollout_mesh"), and internal/proxy/recovery.go's
+	// exact-match lookup of NetworkSettings.Networks["docker_rollout_mesh"]
+	// would never find the container's IP on it.
 	if out.Networks == nil {
 		out.Networks = make(map[string]interface{})
 	}
-	out.Networks["docker_rollout_mesh"] = map[string]interface{}{"driver": "bridge"}
+	out.Networks["docker_rollout_mesh"] = map[string]interface{}{"driver": "bridge", "name": "docker_rollout_mesh"}
 
 	sum := &Summary{}
 
@@ -113,12 +118,18 @@ func buildProxyPair(name string, svc Service) (backing Service, proxy Service, e
 	// Sync network list to RawFields (Networks has yaml:"-").
 	backing.RawFields["networks"] = toRawSlice(backing.Networks)
 
-	// Inject ORBIT_BACKEND env var (informational).
+	// Inject ORBIT_BACKEND env var (informational) and ORBIT_BACKEND_ID — the
+	// latter is required by internal/proxy.DockerRecoverySource.extractBackend
+	// to register this container as the proxy's seed backend on first startup
+	// (before any rollout has run). Matches the "<service>-default" seed ID
+	// rollout.go already expects to deregister after the first successful
+	// rollout (see its Step 9b).
 	if backing.Environment == nil {
 		backing.Environment = make(map[string]string)
 	}
 	if len(pairs) > 0 {
 		backing.Environment["ORBIT_BACKEND"] = fmt.Sprintf("%s:%d", name, pairs[0].container)
+		backing.Environment["ORBIT_BACKEND_ID"] = name + "-default"
 	}
 	// Sync environment map to RawFields (Environment has yaml:"-").
 	backing.RawFields["environment"] = toRawMap(backing.Environment)
@@ -128,9 +139,22 @@ func buildProxyPair(name string, svc Service) (backing Service, proxy Service, e
 	delete(backing.RawFields, "x-docker-rollout")
 
 	// ── Labels ───────────────────────────────────────────────────────────
+	// orbit.io/proxy and orbit.io/generation are both required, non-empty,
+	// by extractBackend's ownership check — without them recovery treats
+	// this container as having "incomplete ownership labels" and never
+	// registers it, leaving the proxy with zero backends forever.
+	//
+	// orbit.io/proxy-instance scopes discovery to this service's own proxy
+	// (matched against ORBIT_PROXY_INSTANCE below) — every proxy on the
+	// mesh network otherwise sees every service's backing containers and
+	// can adopt another service's backend as its own authoritative
+	// generation.
 	labels := map[string]interface{}{
-		"orbit.io/managed": "true",
-		"orbit.io/service": name,
+		"orbit.io/managed":        "true",
+		"orbit.io/service":        name,
+		"orbit.io/proxy":          "false",
+		"orbit.io/generation":     name + "-default",
+		"orbit.io/proxy-instance": name,
 	}
 	if existing, ok := backing.RawFields["labels"]; ok {
 		if m, ok := existing.(map[string]interface{}); ok {
@@ -170,12 +194,13 @@ func buildProxyPair(name string, svc Service) (backing Service, proxy Service, e
 	proxyPorts = append(proxyPorts, fmt.Sprintf("%d:9900", controlHostPort))
 
 	proxyEnv := map[string]string{
-		"ORBIT_BINDS":        strings.Join(binds, ","),
-		"ORBIT_TARGETS":      initialBackend,
-		"ORBIT_CONTROL_PORT": "9900",
+		"ORBIT_BINDS":          strings.Join(binds, ","),
+		"ORBIT_TARGETS":        initialBackend,
+		"ORBIT_CONTROL_PORT":   "9900",
+		"ORBIT_PROXY_INSTANCE": name,
 	}
 	proxy = Service{
-		Image:       "orbit/proxy:latest",
+		Image:       "technicaltalk/orbit:latest",
 		Ports:       proxyPorts,
 		Expose:      []string{"9900"},
 		Networks:    []string{"docker_rollout_mesh"},
@@ -192,6 +217,11 @@ func buildProxyPair(name string, svc Service) (backing Service, proxy Service, e
 				"orbit.io/managed": "true",
 			},
 			"restart": "unless-stopped",
+			// Required for startup/on-demand recovery (internal/proxy.DockerRecoverySource):
+			// the proxy lists and inspects Orbit-managed containers by label to
+			// discover and validate backends. Read-only — it never creates,
+			// starts, or removes containers from inside the proxy.
+			"volumes": toRawSlice([]string{"/var/run/docker.sock:/var/run/docker.sock:ro"}),
 		},
 	}
 

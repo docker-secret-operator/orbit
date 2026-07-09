@@ -62,17 +62,23 @@ func buildRoot(log *zap.Logger) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "docker-orbit",
 		Short: "Zero-downtime deployments for Docker Compose",
-		Long: `docker-orbit injects a built-in TCP proxy into your Docker Compose stack
+		Long: `docker orbit injects a built-in TCP proxy into your Docker Compose stack
 so that container replacements happen without dropping a single connection.
 
 No external proxy (Traefik, nginx) required.
 
 Example:
-  docker-orbit generate                         # enhance docker-compose.yml
+  docker orbit generate                         # enhance docker-compose.yml
   docker compose -f docker-rollout-compose.yml up -d
-  docker-orbit rollout web                      # roll out a new version of 'web'
-  docker-orbit rollback web                     # restore previous version if deploy fails`,
+  docker orbit rollout web                      # roll out a new version of 'web'
+  docker orbit rollback web                     # restore previous version if deploy fails`,
 		SilenceUsage: true,
+		// Use stays "docker-orbit" (the actual binary/plugin filename Cobra
+		// matches internally); this annotation only changes what --help
+		// prints, so it reads as 'docker orbit ...' — how it's actually
+		// invoked as a Docker CLI plugin — matching deploy/doctor/history/
+		// status's Long/Example text, which already assume that form.
+		Annotations: map[string]string{cobra.CommandDisplayNameAnnotation: "docker orbit"},
 	}
 
 	root.AddCommand(
@@ -114,8 +120,8 @@ Auto-detection rules (per service, first match wins):
   4. Everything else         → proxy injected
 
 Example:
-  docker-orbit generate
-  docker-orbit generate --file docker-compose.prod.yml --output docker-rollout-compose.prod.yml`,
+  docker orbit generate
+  docker orbit generate --file docker-compose.prod.yml --output docker-rollout-compose.prod.yml`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cf, err := compose.ParseFile(input)
 			if err != nil {
@@ -174,15 +180,15 @@ Steps:
   9. Deregister old container from proxy
   10. Scale back to original count
 
-If the new container fails its healthcheck within --timeout, docker-orbit scales
+If the new container fails its healthcheck within --timeout, docker orbit scales
 back to 1 automatically without disrupting traffic. If it fails during the
 --stability window (after being registered but before the old container is
-touched), docker-orbit rolls back automatically — the old container was never
+touched), docker orbit rolls back automatically — the old container was never
 drained, so nothing needs to be restored.
 
 Example:
-  docker-orbit rollout web
-  docker-orbit rollout web --pull --timeout 120s --drain 10s --stability 15s`,
+  docker orbit rollout web
+  docker orbit rollout web --pull --timeout 120s --drain 10s --stability 15s`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.Service = args[0]
@@ -206,10 +212,10 @@ Example:
 			// Verify the service exists in docker-rollout-compose.yml.
 			cf, err := compose.ParseFile(opts.ComposeFile)
 			if err != nil {
-				return fmt.Errorf("rollout: read compose file: %w\n(did you run docker-orbit generate first?)", err)
+				return fmt.Errorf("rollout: read compose file: %w\n(did you run docker orbit generate first?)", err)
 			}
 			if _, ok := cf.Services[opts.Service]; !ok {
-				return fmt.Errorf("rollout: service %q not found in %s\n(did you run docker-orbit generate first?)",
+				return fmt.Errorf("rollout: service %q not found in %s\n(did you run docker orbit generate first?)",
 					opts.Service, opts.ComposeFile)
 			}
 
@@ -251,7 +257,7 @@ func scaleCmd(log *zap.Logger) *cobra.Command {
 		Hidden: true, // not yet implemented; hidden so it doesn't appear in --help
 		Args:   cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return fmt.Errorf("scale is not yet implemented — use 'docker-orbit rollout' to deploy new versions")
+			return fmt.Errorf("scale is not yet implemented — use 'docker orbit rollout' to deploy new versions")
 		},
 	}
 	cmd.Flags().StringVarP(&opts.ComposeFile, "file", "f", "docker-rollout-compose.yml", "docker-rollout compose file")
@@ -464,8 +470,32 @@ func executeRecovery(
 	} else {
 		defer source.Close() //nolint:errcheck // deferred source close; error not actionable
 
-		// Discover and validate backends with health checks.
-		recoveryResult, err = source.DiscoverAndValidateBackends(ctx)
+		// Discover and validate backends with health checks. A backend that
+		// hasn't opened its port yet (e.g. Grafana takes several seconds to
+		// boot, and has no Docker HEALTHCHECK to report "starting") fails a
+		// single TCP dial and comes back StartupFailed — permanently, since
+		// nothing else ever retries. A backend with its own Docker
+		// HEALTHCHECK reports "starting" instead (StartupRecovering, e.g.
+		// cadvisor) but is just as unregistered until it flips to healthy.
+		// Retry both cases with a bound of our own: at proxy startup ctx
+		// already carries the StartupTimeout deadline, but the on-demand
+		// `docker orbit recover` path hits this via the HTTP request's
+		// context, which has no deadline at all — an indefinitely unhealthy
+		// backend would otherwise retry forever.
+		retryCtx, retryCancel := context.WithTimeout(ctx, cfg.StartupTimeout)
+		needsRetry := func(res *proxy.RecoveryResult) bool {
+			return res.HealthyCount == 0 &&
+				(res.State == proxy.StartupFailed || res.State == proxy.StartupRecovering)
+		}
+		recoveryResult, err = source.DiscoverAndValidateBackends(retryCtx)
+		for err == nil && needsRetry(recoveryResult) && retryCtx.Err() == nil {
+			select {
+			case <-time.After(time.Second):
+			case <-retryCtx.Done():
+			}
+			recoveryResult, err = source.DiscoverAndValidateBackends(retryCtx)
+		}
+		retryCancel()
 		if err != nil {
 			log.Error("recovery: discovery failed",
 				zap.Error(err))
@@ -638,9 +668,9 @@ func countRestoredBackends(plan *state.RecoveryPlan) int {
 func versionCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
-		Short: "Print docker-orbit version",
+		Short: "Print docker orbit version",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Printf("docker-orbit %s\n", version)
+			fmt.Printf("docker orbit %s\n", version)
 		},
 	}
 }

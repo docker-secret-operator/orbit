@@ -97,7 +97,7 @@ func AcquireLock(service string) (*FileLock, error) {
 			"Actions:\n"+
 			"  1. Wait for deployment to complete\n"+
 			"  2. Verify process: ps -p %d\n"+
-			"  3. Force if confirmed dead: docker-orbit rollout %q --force-unlock\n",
+			"  3. Force if confirmed dead: docker orbit rollout %q --force-unlock\n",
 		service, existing.PID, existing.Hostname,
 		age, lockPath,
 		existing.PID, service,

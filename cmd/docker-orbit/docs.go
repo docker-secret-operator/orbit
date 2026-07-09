@@ -28,6 +28,14 @@ func docsCmd(log *zap.Logger) *cobra.Command {
 				return fmt.Errorf("docs: create %s: %w", outDir, err)
 			}
 			root := buildRoot(log)
+			// docker-orbit generate/docker-orbit_generate.md have used
+			// hyphenated file names since the reference tree was added;
+			// installation.md and .goreleaser.yaml link them by that exact
+			// name. GenMarkdownTree derives both headers and file names from
+			// CommandPath(), which follows the display-name annotation, so
+			// clear it here to keep doc output on the hyphenated form while
+			// live --help still shows 'docker orbit'.
+			delete(root.Annotations, cobra.CommandDisplayNameAnnotation)
 			root.InitDefaultHelpCmd()
 			if err := doc.GenMarkdownTree(root, outDir); err != nil {
 				return fmt.Errorf("docs: generate: %w", err)

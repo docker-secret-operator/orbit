@@ -242,8 +242,14 @@ func GenerateRecoveryPlan(
 	// Phase 4: Determine recovery action
 	determineRecoveryAction(rolloutState, authority, inventory, plan)
 
-	// Phase 5: Select backends to restore
-	selectBackendsToRestore(authority, rolloutState, backends, plan)
+	// Phase 5: Select backends to restore. Uses plan.AuthoritativeGeneration,
+	// not the local authority — determineRecoveryAction's inferred-fallback
+	// branch (no persisted state, e.g. a cold start before any rollout) sets
+	// plan.AuthoritativeGeneration to a value inferred from health, leaving
+	// authority itself at its original "" from Phase 1. Filtering candidates
+	// by the stale "" here means byGeneration[""] is always empty, so a fresh
+	// deploy discovers a healthy backend but never restores it.
+	selectBackendsToRestore(plan.AuthoritativeGeneration, rolloutState, backends, plan)
 
 	// Phase 6: Log recovery plan
 	if log != nil {

@@ -47,10 +47,14 @@ test-soak:
 test-integration:
 	DOCKER_INTEGRATION=true $(GO) test -race -timeout 120s ./tests/integration/...
 
-## install-plugin: Copy the binary to Docker CLI plugins directory
+## install-plugin: Copy the binary to Docker CLI plugins directory (build always runs as you; only the copy escalates, and only if needed)
 install-plugin: build
-	@mkdir -p $(PLUGIN_DIR)
-	cp $(BUILD_DIR)/$(BINARY) $(PLUGIN_DIR)/$(BINARY)
+	@if [ -w "$(PLUGIN_DIR)" ] || { [ ! -e "$(PLUGIN_DIR)" ] && [ -w "$$(dirname $(PLUGIN_DIR))" ]; }; then \
+		mkdir -p $(PLUGIN_DIR) && cp $(BUILD_DIR)/$(BINARY) $(PLUGIN_DIR)/$(BINARY); \
+	else \
+		echo "$(PLUGIN_DIR) needs root — requesting sudo for the copy only (already built as you above)"; \
+		sudo mkdir -p $(PLUGIN_DIR) && sudo cp $(BUILD_DIR)/$(BINARY) $(PLUGIN_DIR)/$(BINARY); \
+	fi
 	@echo "Plugin installed: $(PLUGIN_DIR)/$(BINARY)"
 	@echo "Run: docker orbit --help"
 

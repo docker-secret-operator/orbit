@@ -38,10 +38,10 @@ registered and the old one is removed. If the new deployment fails, run this
 command immediately to restore traffic.
 
 Example:
-  docker-orbit rollback web
-  docker-orbit rollback web --dry-run
-  docker-orbit rollback web --yes --json
-  docker-orbit rollback web --drain 15s --control-addr http://localhost:9901`,
+  docker orbit rollback web
+  docker orbit rollback web --dry-run
+  docker orbit rollback web --yes --json
+  docker orbit rollback web --drain 15s --control-addr http://localhost:9901`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p := output.New(cmd.OutOrStdout(), jsonOut)
