@@ -1,6 +1,7 @@
 package proxy_test
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net"
@@ -195,4 +196,122 @@ func TestServer_RoundRobin_MultipleBackends(t *testing.T) {
 			t.Errorf("backend %s received 0 requests — round-robin may be broken", b.ID)
 		}
 	}
+}
+
+// TestServer_CrossPortIsolation is the load-bearing test for ADR-0006 Stage
+// 1: a single Server binds two ports, each wired to its own Router/Registry
+// pair (as a shared proxy fronting two services would). Traffic on port A
+// must only ever reach registry A's backend, and traffic on port B must
+// only ever reach registry B's — never the other way around.
+//
+// Before Stage 1 PR 4, Server held exactly one router *Router for its whole
+// lifetime, so this test would have been impossible to write meaningfully:
+// every bound port routed through the same single router regardless of
+// which Bind call it came from. This test is what proves that fix actually
+// works, not just that it compiles.
+func TestServer_CrossPortIsolation(t *testing.T) {
+	regA := proxy.NewRegistry()
+	routerA := proxy.NewRouter(regA)
+	addrA := echoServerWithReply(t, "from-A\n")
+	if err := regA.Add(proxy.Backend{ID: "backend-a", Addr: addrA}); err != nil {
+		t.Fatal(err)
+	}
+
+	regB := proxy.NewRegistry()
+	routerB := proxy.NewRouter(regB)
+	addrB := echoServerWithReply(t, "from-B\n")
+	if err := regB.Add(proxy.Backend{ID: "backend-b", Addr: addrB}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := proxy.NewServer(nopLogger(), metrics.New())
+	t.Cleanup(srv.Close)
+
+	if err := srv.Bind(proxy.PortBinding{ListenPort: 0}, routerA); err != nil {
+		t.Fatalf("Bind A: %v", err)
+	}
+	if err := srv.Bind(proxy.PortBinding{ListenPort: 0}, routerB); err != nil {
+		t.Fatalf("Bind B: %v", err)
+	}
+
+	var portA, portB int
+	for _, b := range srv.Bindings() {
+		switch {
+		case portA == 0:
+			portA = b.ListenPort
+		default:
+			portB = b.ListenPort
+		}
+	}
+	if portA == 0 || portB == 0 || portA == portB {
+		t.Fatalf("expected two distinct bound ports, got %d and %d", portA, portB)
+	}
+
+	// Query each port many times; every single response must come from that
+	// port's own backend, never the other one's.
+	for i := 0; i < 20; i++ {
+		gotA := readLine(t, portA)
+		if gotA != "from-A\n" {
+			t.Fatalf("port A (router A) returned %q — leaked traffic to the wrong registry", gotA)
+		}
+		gotB := readLine(t, portB)
+		if gotB != "from-B\n" {
+			t.Fatalf("port B (router B) returned %q — leaked traffic to the wrong registry", gotB)
+		}
+	}
+
+	backendA, ok := regA.Get("backend-a")
+	if !ok {
+		t.Fatal("backend-a missing from registry A")
+	}
+	if backendA.Requests() == 0 {
+		t.Error("backend-a should have received requests routed through port A")
+	}
+	backendB, ok := regB.Get("backend-b")
+	if !ok {
+		t.Fatal("backend-b missing from registry B")
+	}
+	if backendB.Requests() == 0 {
+		t.Error("backend-b should have received requests routed through port B")
+	}
+}
+
+// echoServerWithReply starts a TCP listener that writes reply to every
+// accepted connection (ignoring anything the client sends), then closes.
+func echoServerWithReply(t *testing.T, reply string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				c.Write([]byte(reply)) //nolint:errcheck
+			}(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// readLine dials the given local port and reads one newline-terminated
+// reply through the proxy.
+func readLine(t *testing.T, port int) string {
+	t.Helper()
+	conn := dialTimeout(t, fmt.Sprintf("127.0.0.1:%d", port))
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read from port %d: %v", port, err)
+	}
+	return line
 }
