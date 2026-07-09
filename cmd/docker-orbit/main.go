@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -339,7 +340,7 @@ func runProxy(log *zap.Logger, version string) error {
 	// orbit recover` is available the moment the control API starts
 	// listening, not only after startup recovery finishes.
 	controlSrv.SetRecoveryTrigger(func(ctx context.Context) (api.RecoveryOutcome, error) {
-		startupState, plan, _, err := executeRecovery(ctx, cfg, sm, reg, mc, debugHandler, log)
+		startupState, plan, _, err := executeRecovery(ctx, cfg, sm, reg, cfg.ProxyInstance, mc, debugHandler, log)
 		if err != nil {
 			return api.RecoveryOutcome{}, err
 		}
@@ -360,7 +361,7 @@ func runProxy(log *zap.Logger, version string) error {
 	})
 
 	recoveryCtx, cancel := context.WithTimeout(context.Background(), cfg.StartupTimeout)
-	startupState, _, _, _ := executeRecovery(recoveryCtx, cfg, sm, reg, mc, debugHandler, log)
+	startupState, _, _, _ := executeRecovery(recoveryCtx, cfg, sm, reg, cfg.ProxyInstance, mc, debugHandler, log)
 	cancel()
 
 	// Set control server startup state for readiness endpoint.
@@ -416,7 +417,7 @@ func runProxy(log *zap.Logger, version string) error {
 					continue
 				}
 				log.Info("runtime: zero active backends, attempting rediscovery")
-				startupState, _, _, err := executeRecovery(ctx, cfg, sm, reg, mc, debugHandler, log)
+				startupState, _, _, err := executeRecovery(ctx, cfg, sm, reg, cfg.ProxyInstance, mc, debugHandler, log)
 				if err != nil {
 					log.Warn("runtime: rediscovery attempt failed", zap.Error(err))
 					continue
@@ -441,15 +442,26 @@ func runProxy(log *zap.Logger, version string) error {
 	return nil
 }
 
-// executeRecovery performs one real recovery pass: load persisted
-// active-generation/rollout state, discover live backends from Docker,
-// generate a deterministic recovery plan (state.GenerateRecoveryPlan), and
-// register validated candidates with reg. This is the entire recovery
+// executeRecovery performs one real recovery pass for service: load
+// persisted active-generation/rollout state, discover live backends from
+// Docker, generate a deterministic recovery plan (state.GenerateRecoveryPlan),
+// and register validated candidates with reg. This is the entire recovery
 // implementation — called once at proxy startup (runProxy, above) and
 // on-demand via POST /recover (wired through
-// api.ControlServer.SetRecoveryTrigger, also in runProxy). Both call sites
-// run this exact function; there is no second implementation to drift out
-// of sync with the first.
+// api.ControlServer.SetRecoveryTrigger, also in runProxy), as well as, per
+// service, from executeRecoveryForProject's loop (ADR-0006 Stage 2.3). All
+// call sites run this exact function; there is no second implementation to
+// drift out of sync with the first.
+//
+// service identifies which service this pass recovers — it is what was
+// cfg.ProxyInstance before Stage 2.3 made it an explicit parameter, so a
+// single-service caller passes cfg.ProxyInstance unchanged (identical
+// behavior) while executeRecoveryForProject passes each service name in
+// turn. Every other cfg field used below (TCPDialTimeout, StartupTimeout,
+// TransitionTimeout) is process-wide configuration, not per-service, and is
+// still read from cfg exactly as before — nothing about the recovery
+// algorithm, planner, persisted-state schema, authority semantics, or
+// transaction semantics changed; only which identity string labels the pass.
 //
 // Returns the resulting proxy.StartupState, the RecoveryPlan (nil only if
 // something prevented plan generation entirely, which does not happen in
@@ -463,6 +475,7 @@ func executeRecovery(
 	cfg *config.ProxyConfig,
 	sm *state.StateManager,
 	reg *proxy.Registry,
+	service string,
 	mc *metrics.MetricsCollector,
 	debugHandler *api.DebugHandler,
 	log *zap.Logger,
@@ -478,12 +491,12 @@ func executeRecovery(
 	// return (nil, nil) when no state file exists yet — a non-nil error here
 	// means real corruption or an I/O failure, which must not be silently
 	// treated the same as "no prior state".
-	activeGenState, err := sm.LoadActiveGenerationState(cfg.ProxyInstance)
+	activeGenState, err := sm.LoadActiveGenerationState(service)
 	if err != nil {
 		log.Error("recovery: active generation state unreadable, proceeding as if absent",
 			zap.Error(err))
 	}
-	rolloutState, err := sm.LoadRolloutState(cfg.ProxyInstance)
+	rolloutState, err := sm.LoadRolloutState(service)
 	if err != nil {
 		log.Error("recovery: rollout state unreadable, proceeding as if absent",
 			zap.Error(err))
@@ -501,7 +514,7 @@ func executeRecovery(
 	defer retryCancel()
 
 	var source *proxy.DockerRecoverySource
-	source, err = proxy.NewDockerRecoverySourceWithConfig(cfg.ProxyInstance, log, cfg.TCPDialTimeout, 10)
+	source, err = proxy.NewDockerRecoverySourceWithConfig(service, log, cfg.TCPDialTimeout, 10)
 	for err != nil && retryCtx.Err() == nil {
 		log.Warn("recovery: docker daemon unreachable, retrying within startup budget",
 			zap.Error(err))
@@ -509,7 +522,7 @@ func executeRecovery(
 		case <-time.After(time.Second):
 		case <-retryCtx.Done():
 		}
-		source, err = proxy.NewDockerRecoverySourceWithConfig(cfg.ProxyInstance, log, cfg.TCPDialTimeout, 10)
+		source, err = proxy.NewDockerRecoverySourceWithConfig(service, log, cfg.TCPDialTimeout, 10)
 	}
 	if err != nil {
 		log.Warn("recovery: docker unavailable, generating degraded plan",
@@ -580,11 +593,11 @@ func executeRecovery(
 	// Build GenerationInventory from discovery result.
 	var inventory *state.GenerationInventory
 	if recoveryResult != nil {
-		inventory = buildGenerationInventory(cfg.ProxyInstance, recoveryResult, activeGenState)
+		inventory = buildGenerationInventory(service, recoveryResult, activeGenState)
 	} else {
 		// Empty inventory if discovery failed
 		inventory = &state.GenerationInventory{
-			Service:          cfg.ProxyInstance,
+			Service:          service,
 			GenerationStates: make(map[string]state.GenerationMetrics),
 		}
 	}
@@ -596,7 +609,7 @@ func executeRecovery(
 		for _, backend := range recoveryResult.Backends {
 			gen := backend.Generation
 			if gen == "" {
-				gen = cfg.ProxyInstance + "-default"
+				gen = service + "-default"
 			}
 			backendSnapshots = append(backendSnapshots, state.BackendSnapshot{
 				Generation: gen,
@@ -608,7 +621,7 @@ func executeRecovery(
 	}
 
 	// Generate deterministic recovery plan.
-	plan = state.GenerateRecoveryPlan(sm, cfg.ProxyInstance, rolloutState, activeGenState, inventory, backendSnapshots, cfg.TransitionTimeout, log)
+	plan = state.GenerateRecoveryPlan(sm, service, rolloutState, activeGenState, inventory, backendSnapshots, cfg.TransitionTimeout, log)
 	debugHandler.RecordRecoveryPlan(plan)
 
 	// Execute recovery plan: register backends according to traffic roles.
@@ -695,10 +708,10 @@ func executeRecovery(
 			if registeredCount > 0 {
 				newActiveGen := &state.ActiveGenerationState{
 					SchemaVersion:    state.SchemaVersion,
-					Service:          cfg.ProxyInstance,
+					Service:          service,
 					ActiveGeneration: plan.AuthoritativeGeneration,
 				}
-				if current, loadErr := sm.LoadActiveGenerationState(cfg.ProxyInstance); loadErr == nil && current != nil {
+				if current, loadErr := sm.LoadActiveGenerationState(service); loadErr == nil && current != nil {
 					newActiveGen.PreviousRevision = current.Revision
 				}
 				if err := sm.WriteActiveGenerationState(newActiveGen, log); err != nil {
@@ -709,7 +722,7 @@ func executeRecovery(
 				// generation authority just written above — clear it so a
 				// future boot doesn't keep reloading and re-disproving the
 				// same dead transition on every single recovery pass.
-				if err := sm.DeleteRolloutState(cfg.ProxyInstance); err != nil {
+				if err := sm.DeleteRolloutState(service); err != nil {
 					log.Warn("recovery: could not clear stale rollout state (non-fatal)", zap.Error(err))
 				}
 			}
@@ -757,6 +770,64 @@ func executeRecovery(
 	mc.SetCurrentState(authority, rolloutPhase, string(startupState), startupState == proxy.StartupDegraded || startupState == proxy.StartupFailed)
 
 	return startupState, plan, recoveryResult, nil
+}
+
+// serviceRecoveryOutcome is one service's result from
+// executeRecoveryForProject — the same four values executeRecovery returns,
+// carried alongside the service name.
+type serviceRecoveryOutcome struct {
+	State  proxy.StartupState
+	Plan   *state.RecoveryPlan
+	Result *proxy.RecoveryResult
+	Err    error
+}
+
+// executeRecoveryForProject runs executeRecovery once per service currently
+// registered in pr (ADR-0006 Stage 2.3). It changes only WHERE recovery is
+// invoked, never HOW: each iteration calls the exact same executeRecovery
+// function a single-service proxy already uses, unmodified in algorithm,
+// against that service's own Registry (via pr.For) and its own persisted
+// state (state.StateManager is already keyed by service — see
+// internal/state, untouched by this function).
+//
+// Per implementation invariant II-4, this is one loop in the caller's own
+// goroutine — no goroutine per service, no worker pool, no channels.
+// Services are visited in sorted order for determinism.
+//
+// Each service recovers completely independently, per the Recovery
+// Invariants: its own Registry, its own persisted authority/rollout state,
+// its own DockerRecoverySource, its own RecoveryPlan. One service's pass
+// returning proxy.StartupFailed (or a non-nil err — reserved for future use,
+// never populated by executeRecovery today) does not stop the loop; every
+// other configured service still gets its own attempt. A service that
+// disappears from pr between listing and lookup (concurrent Remove) is
+// skipped for this pass, not treated as an error — the next pass simply
+// won't see it either, exactly like ProjectHealthController.CheckOnce.
+func executeRecoveryForProject(
+	ctx context.Context,
+	cfg *config.ProxyConfig,
+	sm *state.StateManager,
+	pr *proxy.ProjectRegistry,
+	mc *metrics.MetricsCollector,
+	debugHandler *api.DebugHandler,
+	log *zap.Logger,
+) map[string]serviceRecoveryOutcome {
+	services := pr.Services()
+	sort.Strings(services)
+
+	results := make(map[string]serviceRecoveryOutcome, len(services))
+	for _, service := range services {
+		reg, ok := pr.For(service)
+		if !ok {
+			continue
+		}
+		st, plan, result, err := executeRecovery(ctx, cfg, sm, reg, service, mc, debugHandler, log)
+		results[service] = serviceRecoveryOutcome{State: st, Plan: plan, Result: result, Err: err}
+		// Deliberately no early return/break on err or a failed state — one
+		// service's outcome must never prevent the remaining services from
+		// getting their own recovery attempt.
+	}
+	return results
 }
 
 // directVerifyRecoveryResult attempts to resolve persisted authority
