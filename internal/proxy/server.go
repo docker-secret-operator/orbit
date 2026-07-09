@@ -28,6 +28,11 @@ type PortBinding struct {
 	// backend.Addr does not include an explicit port override.
 	// When 0, the router is expected to provide the full addr including port.
 	TargetPort int
+
+	// Service identifies which service this port belongs to, for proxies
+	// fronting more than one service (ADR-0006). Unused by single-service
+	// wiring today.
+	Service string
 }
 
 type portListener struct {
