@@ -295,26 +295,22 @@ func runProxy(log *zap.Logger, version string) error {
 	// Create metrics.
 	m := metrics.New()
 
-	// Create proxy server.
-	reg := proxy.NewRegistry()
-	router := proxy.NewRouter(reg)
-	reg.SetMetrics(m)
-	router.SetMetrics(m)
+	// ADR-0006 Stage 3.5: services.json (or, if absent, cfg.ProxyInstance/
+	// cfg.Binds synthesized into an equivalent single-service config —
+	// see config.ResolveServicesConfig) replaces the implicit
+	// single-service model as the source of truth for which services this
+	// process fronts and which ports each one owns.
+	servicesCfg, err := config.ResolveServicesConfig(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: services config failed: %v\n", err)
+		return err
+	}
+
 	srv := proxy.NewServer(log, m)
-
-	// ADR-0006 Stage 3.1: a ProjectRegistry exists in the running process,
-	// registering today's one Registry under cfg.ProxyInstance. reg remains
-	// what every other call site in this function uses directly; pr is a
-	// second, passive reference to the exact same *Registry, not a second
-	// registry. Stage 3.2 makes ControlServer its first consumer, below.
-	pr := newProjectRegistryForService(cfg.ProxyInstance, reg)
-
-	// Bind ports.
-	for _, binding := range cfg.Binds {
-		if err := srv.Bind(proxy.PortBinding{ListenPort: binding.ListenPort, TargetPort: binding.TargetPort}, router); err != nil {
-			log.Error("proxy: bind failed", zap.Error(err))
-			return err
-		}
+	pr, reg, err := wireProjectRegistry(srv, m, cfg.ProxyInstance, servicesCfg, log)
+	if err != nil {
+		log.Error("proxy: startup failed", zap.Error(err))
+		return err
 	}
 
 	// Initialize state manager for persistent state operations.
@@ -397,6 +393,14 @@ func runProxy(log *zap.Logger, version string) error {
 		// HealthController for this service wraps this exact *Registry
 		// instance (via pr.For), so the hook fires exactly as it did before
 		// this stage; nothing about SetHealthGuarded's behavior changed.
+		//
+		// Scope (ADR-0006 Stage 3.5): this hook is set on cfg.ProxyInstance's
+		// own Registry only, not on every service wireProjectRegistry may
+		// have registered into pr. That's intentional for this stage —
+		// Stage 3.5 is configuration-only and does not extend runtime
+		// orchestration — not an oversight. Stage 4 is where per-service
+		// orchestration across every configured service (not just
+		// cfg.ProxyInstance) gets built out.
 		reg.SetZeroBackendHook(func(id string) {
 			m.IncZeroBackendProtection()
 			log.Warn("runtime: zero-backend protection kept the last active backend",
@@ -421,6 +425,15 @@ func runProxy(log *zap.Logger, version string) error {
 	// `docker orbit recover`. Reuses the same executeRecovery pass this
 	// file's SetRecoveryTrigger already calls on demand, on a slower ticker,
 	// only when the registry is actually empty of active backends.
+	//
+	// Scope (ADR-0006 Stage 3.5): the emptiness gate below (reg.Active())
+	// and the result extraction (results[cfg.ProxyInstance]) only cover
+	// cfg.ProxyInstance's own service, not every service wireProjectRegistry
+	// may have registered into pr. Intentional for this stage — Stage 3.5
+	// is configuration-only and does not extend runtime orchestration.
+	// Stage 4 is where this gate and extraction are expected to generalize
+	// to iterate every service in pr.Services(), the same pattern
+	// executeRecoveryForProject and ProjectHealthController already use.
 	go func() {
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
@@ -459,17 +472,67 @@ func runProxy(log *zap.Logger, version string) error {
 	return nil
 }
 
-// newProjectRegistryForService constructs a ProjectRegistry containing
-// exactly one registered service: name → reg. ADR-0006 Stage 3.1 —
-// dependency injection only, extracted out of runProxy (which cannot be
-// unit-tested directly: it binds real ports, starts an HTTP server, and
-// blocks on a shutdown signal) so this specific piece of wiring — and only
-// this piece — is independently testable without touching anything else
-// runProxy does.
-func newProjectRegistryForService(name string, reg *proxy.Registry) *proxy.ProjectRegistry {
+// wireProjectRegistry constructs one *proxy.Registry/*proxy.Router pair per
+// service in sc, binds that service's ports on srv, and registers each
+// Registry into a new ProjectRegistry (ADR-0006 Stage 3.5). This is
+// configuration→construction wiring only: it never inspects Docker, never
+// decides health or recovery, and never registers a backend — it builds
+// the empty per-service Registry instances every other subsystem
+// (ProjectHealthController, executeRecoveryForProject, ControlServer) then
+// discovers backends into, exactly as a single-service runProxy already
+// did before this stage.
+//
+// Extracted out of runProxy (which cannot be unit-tested directly: it
+// binds real ports, starts an HTTP server, and blocks on a shutdown
+// signal) so this wiring is independently testable.
+//
+// Returns the constructed ProjectRegistry, plus defaultService's own
+// *proxy.Registry (an error if defaultService — cfg.ProxyInstance — isn't
+// among sc's services, which config.ResolveServicesConfig's own synthesis
+// path guarantees never happens for the single-service compatibility case,
+// only possible with a hand-authored services.json that omits it). Every
+// other line in runProxy that references a single service's Registry
+// directly (the zero-backend hook, the periodic-rediscovery gate) keeps
+// using exactly this one *proxy.Registry, unchanged — Stage 3.5 changes
+// only how registries are constructed and registered, not any runtime
+// behavior after registration.
+func wireProjectRegistry(
+	srv *proxy.Server,
+	m *metrics.Proxy,
+	defaultService string,
+	sc *config.ServicesConfig,
+	log *zap.Logger,
+) (*proxy.ProjectRegistry, *proxy.Registry, error) {
 	pr := proxy.NewProjectRegistry()
-	pr.Register(name, reg)
-	return pr
+	var defaultReg *proxy.Registry
+
+	for _, svc := range sc.Services {
+		svcReg := proxy.NewRegistry()
+		svcReg.SetMetrics(m)
+		svcRouter := proxy.NewRouter(svcReg)
+		svcRouter.SetMetrics(m)
+
+		for _, binding := range svc.Binds {
+			pb := proxy.PortBinding{ListenPort: binding.ListenPort, TargetPort: binding.TargetPort, Service: svc.Name}
+			if err := srv.Bind(pb, svcRouter); err != nil {
+				return nil, nil, fmt.Errorf("service %q: bind failed: %w", svc.Name, err)
+			}
+		}
+
+		pr.Register(svc.Name, svcReg)
+		log.Info("proxy: service configured",
+			zap.String("service", svc.Name),
+			zap.Int("binds", len(svc.Binds)))
+
+		if svc.Name == defaultService {
+			defaultReg = svcReg
+		}
+	}
+
+	if defaultReg == nil {
+		return nil, nil, fmt.Errorf("configured instance %q not found among the %d service(s) in services.json", defaultService, len(sc.Services))
+	}
+	return pr, defaultReg, nil
 }
 
 // executeRecovery performs one real recovery pass for service: load

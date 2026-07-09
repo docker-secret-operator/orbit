@@ -35,6 +35,13 @@ type ProxyConfig struct {
 	TCPDialTimeout          time.Duration
 	TransitionTimeout       time.Duration // Max time for authority transition (default: 5m)
 
+	// Reconciliation (ADR-0006 Stage 4). Interval between periodic Docker
+	// reconciliation passes — the safety net that corrects whatever the
+	// event fast path missed (INV-4). Default 30s: a starting point per the
+	// ADR, not a tuned value. Declared here now so the config surface is
+	// frozen before the Stage 4 Reconciler that consumes it lands (PR 4.1).
+	ReconcileInterval time.Duration
+
 	// Proxy instance ID (for future multi-proxy)
 	ProxyInstance string
 
@@ -44,8 +51,8 @@ type ProxyConfig struct {
 
 // PortBinding represents a host:container port mapping.
 type PortBinding struct {
-	ListenPort int
-	TargetPort int
+	ListenPort int `json:"listen_port"`
+	TargetPort int `json:"target_port"`
 }
 
 // LoadProxyConfig reads configuration from environment variables.
@@ -64,6 +71,7 @@ func LoadProxyConfig() (*ProxyConfig, error) {
 		StartupTimeout:          30 * time.Second,
 		TCPDialTimeout:          2 * time.Second,
 		TransitionTimeout:       5 * time.Minute,
+		ReconcileInterval:       30 * time.Second,
 		ProxyInstance:           getEnvOrDefault("ORBIT_PROXY_INSTANCE", "default"),
 	}
 
@@ -99,6 +107,7 @@ func LoadProxyConfig() (*ProxyConfig, error) {
 		"ORBIT_STARTUP_TIMEOUT":           &cfg.StartupTimeout,
 		"ORBIT_TCP_DIAL_TIMEOUT":          &cfg.TCPDialTimeout,
 		"ORBIT_TRANSITION_TIMEOUT":        &cfg.TransitionTimeout,
+		"ORBIT_RECONCILE_INTERVAL":        &cfg.ReconcileInterval,
 	}
 
 	for envVar, dest := range timeoutVars {
