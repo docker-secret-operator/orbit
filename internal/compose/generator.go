@@ -2,6 +2,7 @@ package compose
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -11,6 +12,14 @@ type Summary struct {
 	Proxied  []string // service names that received proxy injection
 	Skipped  []string // service names that were auto-excluded (databases)
 	PassThru []string // service names passed through unchanged
+
+	// SharedProxyBinds is populated only by GenerateShared: one entry per
+	// proxied service, naming the host/container port pair the shared
+	// proxy binds on that service's behalf. The caller (cmd/docker-orbit)
+	// uses this to write the services.json companion file
+	// internal/config.ResolveServicesConfig reads at proxy startup — never
+	// populated by Generate (the legacy, one-proxy-per-service path).
+	SharedProxyBinds []PortBinding
 }
 
 // Generate transforms an input ComposeFile into an Orbit-enhanced output.
@@ -76,17 +85,17 @@ func Generate(input *ComposeFile) (*ComposeFile, *Summary, error) {
 
 		default:
 			// Inject proxy.
-			backing, proxy, err := buildProxyPair(name, svc)
+			backing, pairs, err := buildBackingService(name, svc)
 			if err != nil {
 				return nil, nil, fmt.Errorf("generator: service %q: %w", name, err)
 			}
 			out.Services[name] = backing
-			out.Services["docker-rollout-proxy-"+name] = proxy
+			out.Services["docker-rollout-proxy-"+name] = buildLegacyProxyService(name, pairs)
 			sum.Proxied = append(sum.Proxied, name)
 
 			// Named volume for the proxy's ORBIT_STATE_DIR (/var/lib/orbit) —
-			// see buildProxyPair's volume mount. Declared here, not in
-			// buildProxyPair, because top-level `volumes:` entries live on
+			// see buildLegacyProxyService's volume mount. Declared here, not
+			// in the helper, because top-level `volumes:` entries live on
 			// ComposeFile, not Service.
 			out.Volumes[stateVolumeName(name)] = nil
 		}
@@ -95,19 +104,125 @@ func Generate(input *ComposeFile) (*ComposeFile, *Summary, error) {
 	return out, sum, nil
 }
 
-// buildProxyPair builds the backing service (ports removed) and the
-// generated docker-rollout-proxy-<service> for a single eligible service.
-func buildProxyPair(name string, svc Service) (backing Service, proxy Service, err error) {
-	// ── Backing service ───────────────────────────────────────────────────
+// GenerateShared transforms an input ComposeFile the same way Generate does
+// — identical eligibility rules (skip / no-ports / database / inject),
+// identical per-service backing-service transformation (labels, network,
+// env, stripped ports) — but emits exactly one shared docker-rollout-proxy
+// service fronting every eligible service, instead of one proxy per
+// service (ADR-0006 §"Shared Proxy and Event-Driven Discovery").
+//
+// This is a distinct, opt-in entry point specifically so Generate's output
+// for every existing deployment — single-service or multi-service — is
+// completely unaffected: nothing changes unless a caller explicitly calls
+// GenerateShared instead (wired to the `--shared-proxy` flag on
+// `docker orbit generate`, cmd/docker-orbit/main.go).
+//
+// The returned Summary's SharedProxyBinds field carries the per-service
+// port bindings the caller needs to write the services.json companion file
+// (internal/config.ResolveServicesConfig reads it at proxy startup) — this
+// function performs no file I/O itself, matching Generate's existing
+// pure-transformation contract.
+func GenerateShared(input *ComposeFile) (*ComposeFile, *Summary, error) {
+	if input == nil {
+		return nil, nil, fmt.Errorf("generator: nil compose file")
+	}
+
+	out := &ComposeFile{
+		Version:  input.Version,
+		Services: make(map[string]Service, len(input.Services)+1),
+		Networks: deepCopyMap(input.Networks),
+		Volumes:  deepCopyMap(input.Volumes),
+	}
+
+	if out.Networks == nil {
+		out.Networks = make(map[string]interface{})
+	}
+	out.Networks["docker_rollout_mesh"] = map[string]interface{}{"driver": "bridge", "name": "docker_rollout_mesh"}
+
+	if out.Volumes == nil {
+		out.Volumes = make(map[string]interface{})
+	}
+
+	sum := &Summary{}
+	var entries []sharedEntry
+
+	for name, svc := range input.Services {
+		switch {
+		case svc.XRollout.Skip:
+			out.Services[name] = copyService(svc)
+			sum.PassThru = append(sum.PassThru, name)
+
+		case len(svc.Ports) == 0:
+			out.Services[name] = copyService(svc)
+			sum.PassThru = append(sum.PassThru, name)
+
+		case IsDatabase(svc.Image):
+			out.Services[name] = copyService(svc)
+			sum.Skipped = append(sum.Skipped, name)
+
+		default:
+			backing, pairs, err := buildBackingService(name, svc)
+			if err != nil {
+				return nil, nil, fmt.Errorf("generator: service %q: %w", name, err)
+			}
+			out.Services[name] = backing
+			sum.Proxied = append(sum.Proxied, name)
+			entries = append(entries, sharedEntry{name: name, pairs: pairs})
+		}
+	}
+
+	if len(entries) > 0 {
+		// Deterministic regardless of Go's randomized map iteration order —
+		// the "default" service (ORBIT_PROXY_INSTANCE / ORBIT_BINDS, used
+		// for unscoped control-API requests until Control API service
+		// scoping ships) must be the same service on every run.
+		sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+
+		proxy, binds := buildSharedProxyService(entries)
+		out.Services["docker-rollout-proxy"] = proxy
+		out.Volumes[sharedStateVolumeName] = nil
+		sum.SharedProxyBinds = binds
+	}
+
+	return out, sum, nil
+}
+
+// portPair is a parsed host→container port mapping, shared by the legacy
+// (one-proxy-per-service) and shared-proxy generation paths.
+type portPair struct{ host, container int }
+
+// sharedEntry is one eligible service's contribution to a shared proxy:
+// its name and parsed port pairs, collected by GenerateShared before
+// buildSharedProxyService constructs the single proxy stanza.
+type sharedEntry struct {
+	name  string
+	pairs []portPair
+}
+
+// sharedStateVolumeName is the one named volume backing every service's
+// ORBIT_STATE_DIR in shared-proxy mode. Singular (unlike stateVolumeName,
+// one per legacy per-service proxy) because state.StateManager already
+// keys persisted files by service internally (ADR-0006 Stage 2.3) — one
+// shared proxy process, one state directory, is already the correct shape
+// for the runtime it mounts into.
+const sharedStateVolumeName = "docker_rollout_state_shared"
+
+// buildBackingService applies every backing-service transformation shared
+// by both generation paths — port removal, mesh network join, ownership
+// env/labels, container_name stripping — parameterized only by the
+// service's own name and definition, never by which proxy (legacy or
+// shared) will front it. Extracted from what was buildProxyPair's backing-
+// service half so Generate and GenerateShared can never drift apart on
+// this logic.
+func buildBackingService(name string, svc Service) (backing Service, pairs []portPair, err error) {
 	backing = copyService(svc)
 
 	// Collect host→container port mappings before we remove ports.
-	type portPair struct{ host, container int }
-	pairs := make([]portPair, 0, len(svc.Ports))
+	pairs = make([]portPair, 0, len(svc.Ports))
 	for _, p := range svc.Ports {
 		h, c, err := parsePort(p)
 		if err != nil {
-			return Service{}, Service{}, fmt.Errorf("parse port %q: %w", p, err)
+			return Service{}, nil, fmt.Errorf("parse port %q: %w", p, err)
 		}
 		pairs = append(pairs, portPair{h, c})
 	}
@@ -186,7 +301,14 @@ func buildProxyPair(name string, svc Service) (backing Service, proxy Service, e
 		backing.RawFields["labels"] = labels
 	}
 
-	// ── Proxy service ─────────────────────────────────────────────────────
+	return backing, pairs, nil
+}
+
+// buildLegacyProxyService builds the docker-rollout-proxy-<service> stanza
+// for a single service, fronting it alone — the pre-Stage-5 topology,
+// unchanged in every respect from before this file was split. Only
+// Generate calls this; GenerateShared uses buildSharedProxyService instead.
+func buildLegacyProxyService(name string, pairs []portPair) Service {
 	// Build ORBIT_BINDS from port pairs.
 	binds := make([]string, 0, len(pairs))
 	for _, pp := range pairs {
@@ -195,9 +317,9 @@ func buildProxyPair(name string, svc Service) (backing Service, proxy Service, e
 
 	// Initial backend entry: the backing service is reachable by DNS name
 	// on docker_rollout_mesh at its container port.
-	initialBackend := fmt.Sprintf("%s-default:%s:%d", name, name, pairs[0].container)
-	if len(pairs) == 0 {
-		initialBackend = ""
+	initialBackend := ""
+	if len(pairs) > 0 {
+		initialBackend = fmt.Sprintf("%s-default:%s:%d", name, name, pairs[0].container)
 	}
 
 	// Ports owned by the proxy (original host port bindings).
@@ -219,7 +341,7 @@ func buildProxyPair(name string, svc Service) (backing Service, proxy Service, e
 		"ORBIT_CONTROL_PORT":   "9900",
 		"ORBIT_PROXY_INSTANCE": name,
 	}
-	proxy = Service{
+	return Service{
 		Image:       "technicaltalk/orbit:latest",
 		Ports:       proxyPorts,
 		Expose:      []string{"9900"},
@@ -255,9 +377,136 @@ func buildProxyPair(name string, svc Service) (backing Service, proxy Service, e
 			}),
 		},
 	}
-
-	return backing, proxy, nil
 }
+
+// buildSharedProxyService builds the single docker-rollout-proxy stanza
+// fronting every service in entries (ADR-0006 Stage 4/5: one Docker API
+// connection per project, one proxy process per project — see
+// docs/adr/ADR-0006-shared-proxy-and-event-driven-discovery.md). entries
+// must already be sorted by name (GenerateShared sorts before calling)
+// so the "default" service chosen below is deterministic across runs,
+// not dependent on Go's randomized map iteration order.
+//
+// Returns the proxy Service and the flat list of per-service port
+// bindings the caller writes into the services.json companion file —
+// internal/config.ResolveServicesConfig (unchanged) reads that file at
+// proxy startup and is the sole source of truth for which services this
+// process fronts; nothing generated here talks to that runtime code
+// directly, matching Generate's existing pure-transformation contract.
+func buildSharedProxyService(entries []sharedEntry) (Service, []PortBinding) {
+	var (
+		proxyPorts []string
+		depends    []string
+		binds      []PortBinding
+	)
+
+	// The alphabetically-first proxied service (entries is pre-sorted) is
+	// the "default" for ORBIT_PROXY_INSTANCE/ORBIT_BINDS — the same
+	// backward-compatibility role config.ResolveServicesConfig's own
+	// single-service synthesis fallback already documents, and the value
+	// every unscoped control-API request resolves to until Control API
+	// service scoping (ADR-0006 §"Control API: Service Dimension") ships.
+	defaultEntry := entries[0]
+	var defaultBinds []string
+
+	for _, e := range entries {
+		depends = append(depends, e.name)
+		for _, pp := range e.pairs {
+			proxyPorts = append(proxyPorts, fmt.Sprintf("%d:%d", pp.host, pp.host))
+			binds = append(binds, PortBinding{ListenPort: pp.host, Service: e.name, TargetPort: pp.container})
+			if e.name == defaultEntry.name {
+				defaultBinds = append(defaultBinds, fmt.Sprintf("%d:%d", pp.host, pp.container))
+			}
+		}
+	}
+
+	// One control port for the whole shared process — not one per
+	// service, since there is only one proxy container now. Same
+	// first-host-port+6900 convention as the legacy path, applied once
+	// against the default service's own first port.
+	controlHostPort := 9900
+	if len(defaultEntry.pairs) > 0 {
+		controlHostPort = defaultEntry.pairs[0].host + 6900
+	}
+	proxyPorts = append(proxyPorts, fmt.Sprintf("%d:9900", controlHostPort))
+
+	proxyEnv := map[string]string{
+		// ORBIT_BINDS/ORBIT_PROXY_INSTANCE satisfy config.LoadProxyConfig's
+		// baseline validation (ORBIT_BINDS must be non-empty) and back the
+		// single-service synthesis fallback in config.ResolveServicesConfig
+		// — but services.json (mounted below) is present and takes
+		// precedence, so every configured service is wired into
+		// ProjectRegistry, not just the default one.
+		"ORBIT_BINDS":           strings.Join(defaultBinds, ","),
+		"ORBIT_CONTROL_PORT":    "9900",
+		"ORBIT_PROXY_INSTANCE":  defaultEntry.name,
+		"ORBIT_SERVICES_CONFIG": servicesConfigMountPath,
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.name)
+	}
+
+	return Service{
+		Image:       "technicaltalk/orbit:latest",
+		Ports:       proxyPorts,
+		Expose:      []string{"9900"},
+		Networks:    []string{"docker_rollout_mesh"},
+		DependsOn:   depends,
+		Environment: proxyEnv,
+		RawFields: map[string]interface{}{
+			"environment": toRawMap(proxyEnv),
+			"networks":    toRawSlice([]string{"docker_rollout_mesh"}),
+			"depends_on":  toRawSlice(depends),
+			"labels": map[string]interface{}{
+				// orbit.io/proxy=true is load-bearing: Reconciler
+				// (internal/proxy/reconciler.go) filters out any
+				// container carrying it, so the shared proxy is never
+				// mistaken for one of its own backends. No singular
+				// orbit.io/service value — this container fronts N
+				// services, not one — orbit.io/services below is
+				// purely informational (docker ps/inspect ergonomics),
+				// consumed by no runtime code.
+				"orbit.io/proxy":    "true",
+				"orbit.io/managed":  "true",
+				"orbit.io/services": strings.Join(names, ","),
+			},
+			"restart": "unless-stopped",
+			"volumes": toRawSlice([]string{
+				"/var/run/docker.sock:/var/run/docker.sock:ro",
+				sharedStateVolumeName + ":/var/lib/orbit",
+				// services.json companion file — cmd/docker-orbit's
+				// generateCmd writes it alongside the compose file
+				// this service is generated into; mounted read-only,
+				// matching every other config-surface mount here.
+				servicesConfigHostFile + ":" + servicesConfigMountPath + ":ro",
+			}),
+		},
+	}, binds
+}
+
+// SharedServicesConfigFileName is the bare filename of the services.json
+// companion file a shared-proxy deployment needs alongside its generated
+// compose file. Exported so cmd/docker-orbit's generateCmd — the only
+// place that performs file I/O in this whole pipeline, per Generate's
+// existing pure-transformation contract — knows exactly what to name the
+// file it writes; the two must agree, so one exported constant is the
+// single source of truth rather than a literal duplicated in two packages.
+const SharedServicesConfigFileName = "docker-rollout-services.json"
+
+// servicesConfigHostFile is the relative path form written into the
+// generated compose file's volume mount — resolved by Docker Compose
+// relative to the compose file's own directory, the same convention every
+// other bind mount in this generator already relies on.
+const servicesConfigHostFile = "./" + SharedServicesConfigFileName
+
+// servicesConfigMountPath matches internal/config.DefaultServicesConfigPath
+// exactly — duplicated as a literal (not imported) so internal/compose
+// never depends on internal/config, keeping the two packages peers per
+// the existing architecture (cmd/docker-orbit is the integration point
+// that already imports both).
+const servicesConfigMountPath = "/etc/orbit/services.json"
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

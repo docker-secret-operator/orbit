@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -204,6 +205,48 @@ func (cs *ControlServer) resolveRegistry(w http.ResponseWriter, service string) 
 		return nil, false
 	}
 	return reg, true
+}
+
+// requireProvableService is the choke point every MUTATING handler must
+// pass through before touching Registry or persisted authority state
+// (Phase 5.B). The invariant: a mutation must never be applied to a
+// service whose target cannot be proven from the request — never inferred
+// (e.g. from a backend ID's naming convention), never silently defaulted
+// to cs.service when more than one service is configured.
+//
+// Today, with no service-scoped routes yet (ADR-0006 § Control API:
+// Service Dimension, deferred), there is exactly one case where a target
+// is provable without one: the process configures exactly one service, so
+// that service is the target by elimination, not by guessing. When more
+// than one service is configured, no unscoped request can prove which one
+// it means, so every mutating request is rejected — this is not a
+// permanent "multi-service is unsupported" policy, it is what "provable
+// identity" reduces to before scoped routes exist. Once
+// /services/{name}/... routes land, this is the one place they plug in: a
+// request naming its own target proves it explicitly, exactly like the
+// single-service case proves its target by elimination — neither replaces
+// the other.
+//
+// Read-only handlers do not call this — they are unaffected: serving a
+// stale or default-scoped read is not a correctness risk the way a
+// misdirected write is, and grouping them here would reject harmless
+// requests for no safety benefit.
+//
+// On success returns the provable service name (always cs.service today)
+// and true. On failure it has already written the HTTP error response
+// itself and returns ("", false); callers must return immediately without
+// touching w again, matching resolveRegistry's own contract.
+func (cs *ControlServer) requireProvableService(w http.ResponseWriter) (string, bool) {
+	services := cs.projectRegistry.Services()
+	if len(services) <= 1 {
+		return cs.service, true
+	}
+	sort.Strings(services)
+	writeErr(w, http.StatusBadRequest,
+		fmt.Sprintf("cannot determine target service: this proxy configures %d services (%s) and mutating requests do not name one — service-scoped routes are required for this operation, not yet implemented",
+			len(services), strings.Join(services, ", ")),
+		"ambiguous_service")
+	return "", false
 }
 
 // GET /status — consolidated deployment/proxy/recovery status. Backing for
@@ -459,7 +502,11 @@ func validateBackendID(id string) error {
 }
 
 func (cs *ControlServer) addBackend(w http.ResponseWriter, r *http.Request) {
-	reg, ok := cs.resolveRegistry(w, cs.service)
+	service, ok := cs.requireProvableService(w)
+	if !ok {
+		return
+	}
+	reg, ok := cs.resolveRegistry(w, service)
 	if !ok {
 		return
 	}
@@ -506,7 +553,11 @@ func (cs *ControlServer) addBackend(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cs *ControlServer) drainBackend(w http.ResponseWriter, id string) {
-	reg, ok := cs.resolveRegistry(w, cs.service)
+	service, ok := cs.requireProvableService(w)
+	if !ok {
+		return
+	}
+	reg, ok := cs.resolveRegistry(w, service)
 	if !ok {
 		return
 	}
@@ -523,7 +574,11 @@ func (cs *ControlServer) drainBackend(w http.ResponseWriter, id string) {
 }
 
 func (cs *ControlServer) removeBackend(w http.ResponseWriter, id string) {
-	reg, ok := cs.resolveRegistry(w, cs.service)
+	service, ok := cs.requireProvableService(w)
+	if !ok {
+		return
+	}
+	reg, ok := cs.resolveRegistry(w, service)
 	if !ok {
 		return
 	}

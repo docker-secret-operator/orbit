@@ -26,6 +26,10 @@ func (cs *ControlServer) handleAuthorityTransitioning(w http.ResponseWriter, r *
 		methodNotAllowed(w, r.Method, "POST")
 		return
 	}
+	service, ok := cs.requireProvableService(w)
+	if !ok {
+		return
+	}
 	if cs.sm == nil {
 		w.WriteHeader(http.StatusOK)
 		return
@@ -44,7 +48,7 @@ func (cs *ControlServer) handleAuthorityTransitioning(w http.ResponseWriter, r *
 		return
 	}
 
-	current, loadErr := cs.sm.LoadRolloutState(cs.service)
+	current, loadErr := cs.sm.LoadRolloutState(service)
 	if loadErr != nil {
 		cs.log.Warn("authority: existing rollout state unreadable, writing over it",
 			zap.Error(loadErr))
@@ -54,7 +58,7 @@ func (cs *ControlServer) handleAuthorityTransitioning(w http.ResponseWriter, r *
 	now := time.Now()
 	rs := &state.RolloutState{
 		SchemaVersion:      state.SchemaVersion,
-		Service:            cs.service,
+		Service:            service,
 		OldGeneration:      req.Old,
 		NewGeneration:      req.New,
 		Phase:              state.RolloutDraining,
@@ -91,6 +95,10 @@ func (cs *ControlServer) handleAuthorityCommit(w http.ResponseWriter, r *http.Re
 		methodNotAllowed(w, r.Method, "POST")
 		return
 	}
+	service, ok := cs.requireProvableService(w)
+	if !ok {
+		return
+	}
 	if cs.sm == nil {
 		w.WriteHeader(http.StatusOK)
 		return
@@ -108,7 +116,7 @@ func (cs *ControlServer) handleAuthorityCommit(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	current, loadErr := cs.sm.LoadActiveGenerationState(cs.service)
+	current, loadErr := cs.sm.LoadActiveGenerationState(service)
 	if loadErr != nil {
 		cs.log.Warn("authority: existing active-generation state unreadable, writing over it",
 			zap.Error(loadErr))
@@ -117,7 +125,7 @@ func (cs *ControlServer) handleAuthorityCommit(w http.ResponseWriter, r *http.Re
 
 	ags := &state.ActiveGenerationState{
 		SchemaVersion:    state.SchemaVersion,
-		Service:          cs.service,
+		Service:          service,
 		ActiveGeneration: req.Generation,
 	}
 	if current != nil {
@@ -134,7 +142,7 @@ func (cs *ControlServer) handleAuthorityCommit(w http.ResponseWriter, r *http.Re
 	// (e.g. the very first seed commit) has no RolloutState to clear, and
 	// DeleteRolloutState on a missing file is not an error worth failing
 	// the request over.
-	if err := cs.sm.DeleteRolloutState(cs.service); err != nil {
+	if err := cs.sm.DeleteRolloutState(service); err != nil {
 		cs.log.Warn("authority: could not clear rollout state after commit", zap.Error(err))
 	}
 

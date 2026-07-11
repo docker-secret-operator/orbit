@@ -41,6 +41,29 @@ type Proxy struct {
 	RetryLatencyNanos atomic.Uint64 // summed retry latency (ns)
 	RetryLatencyCount atomic.Uint64 // number of retry-latency samples
 
+	// Reconciliation counters (ADR-0006 Stage 4, PR 4.2). Describe the
+	// periodic Docker-to-Registry membership convergence pass — distinct
+	// from recovery (authority-aware) and health (liveness) counters above.
+	ReconciliationRuns          atomic.Uint64 // reconciliation passes performed
+	ReconciliationFailures      atomic.Uint64 // per-service problems logged during a pass
+	ContainersAdded             atomic.Uint64 // backends added to a registry by reconciliation
+	ContainersRemoved           atomic.Uint64 // backends removed from a registry by reconciliation
+	ReconciliationDurationNanos atomic.Uint64 // summed reconciliation pass duration (ns)
+	ReconciliationDurationCount atomic.Uint64 // number of reconciliation pass duration samples
+	ReconciliationRejected      atomic.Uint64 // concurrent invocations rejected by the re-entrancy guard
+
+	// Docker Events counters (ADR-0006 Stage 4, PR 4.3). Describe the
+	// event-stream fast path — a notification mechanism only; Docker
+	// inspection (via the reconciliation counters above) remains the sole
+	// source of truth.
+	EventSourceReconnects         atomic.Uint64 // successful event-stream reconnects
+	EventSourceReconnectFailures  atomic.Uint64 // failed reconnect attempts
+	EventsReceived                atomic.Uint64 // Docker event messages received
+	EventsIgnored                 atomic.Uint64 // received events outside the accepted action set
+	ReconcileTriggeredByPeriodic  atomic.Uint64 // reconciliation passes started by the periodic tick
+	ReconcileTriggeredByEvent     atomic.Uint64 // reconciliation passes started by a Docker event
+	ReconcileTriggeredByReconnect atomic.Uint64 // reconciliation passes started by a stream reconnect
+
 	startTime time.Time
 }
 
@@ -114,6 +137,49 @@ func (p *Proxy) AddRetryLatency(d time.Duration) {
 	p.RetryLatencyCount.Add(1)
 }
 
+// IncReconciliationRuns records one reconciliation pass performed.
+func (p *Proxy) IncReconciliationRuns() { p.ReconciliationRuns.Add(1) }
+
+// IncReconciliationFailures records one per-service problem logged during a
+// reconciliation pass (never a whole-pass abort — see Reconciler).
+func (p *Proxy) IncReconciliationFailures() { p.ReconciliationFailures.Add(1) }
+
+// IncContainersAdded records n backends added to a registry by reconciliation.
+func (p *Proxy) IncContainersAdded(n int) { p.ContainersAdded.Add(uint64(n)) }
+
+// IncContainersRemoved records n backends removed from a registry by reconciliation.
+func (p *Proxy) IncContainersRemoved(n int) { p.ContainersRemoved.Add(uint64(n)) }
+
+// ObserveReconciliationDuration records the elapsed time of one reconciliation pass.
+func (p *Proxy) ObserveReconciliationDuration(d time.Duration) {
+	p.ReconciliationDurationNanos.Add(uint64(d.Nanoseconds()))
+	p.ReconciliationDurationCount.Add(1)
+}
+
+// IncReconciliationRejected records one concurrent invocation rejected by the re-entrancy guard.
+func (p *Proxy) IncReconciliationRejected() { p.ReconciliationRejected.Add(1) }
+
+// IncReconnects records one successful Docker event-stream reconnect.
+func (p *Proxy) IncReconnects() { p.EventSourceReconnects.Add(1) }
+
+// IncReconnectFailures records one failed event-stream reconnect attempt.
+func (p *Proxy) IncReconnectFailures() { p.EventSourceReconnectFailures.Add(1) }
+
+// IncEventsReceived records one Docker event message received.
+func (p *Proxy) IncEventsReceived() { p.EventsReceived.Add(1) }
+
+// IncEventsIgnored records one received event outside the accepted action set.
+func (p *Proxy) IncEventsIgnored() { p.EventsIgnored.Add(1) }
+
+// IncReconcileTriggeredByPeriodic records one reconciliation pass started by the periodic tick.
+func (p *Proxy) IncReconcileTriggeredByPeriodic() { p.ReconcileTriggeredByPeriodic.Add(1) }
+
+// IncReconcileTriggeredByEvent records one reconciliation pass started by a Docker event.
+func (p *Proxy) IncReconcileTriggeredByEvent() { p.ReconcileTriggeredByEvent.Add(1) }
+
+// IncReconcileTriggeredByReconnect records one reconciliation pass started by a stream reconnect.
+func (p *Proxy) IncReconcileTriggeredByReconnect() { p.ReconcileTriggeredByReconnect.Add(1) }
+
 // WritePrometheus writes Prometheus text-format metrics to w.
 // backends and activeBackends are the current registry totals (caller-supplied).
 func (p *Proxy) WritePrometheus(w io.Writer, backends, activeBackends int) {
@@ -178,6 +244,48 @@ func (p *Proxy) WritePrometheus(w io.Writer, backends, activeBackends int) {
 
 	metric("Passive-failover retry-latency sample count", "counter",
 		"orbit_retry_latency_seconds_count", p.RetryLatencyCount.Load())
+
+	metric("Reconciliation passes performed", "counter",
+		"orbit_reconciliation_runs_total", p.ReconciliationRuns.Load())
+
+	metric("Reconciliation per-service problems logged", "counter",
+		"orbit_reconciliation_failures_total", p.ReconciliationFailures.Load())
+
+	metric("Backends added to a registry by reconciliation", "counter",
+		"orbit_reconciliation_containers_added_total", p.ContainersAdded.Load())
+
+	metric("Backends removed from a registry by reconciliation", "counter",
+		"orbit_reconciliation_containers_removed_total", p.ContainersRemoved.Load())
+
+	metric("Summed reconciliation pass duration in seconds", "counter",
+		"orbit_reconciliation_duration_seconds_sum", fmt.Sprintf("%.6f", float64(p.ReconciliationDurationNanos.Load())/1e9))
+
+	metric("Reconciliation pass duration sample count", "counter",
+		"orbit_reconciliation_duration_seconds_count", p.ReconciliationDurationCount.Load())
+
+	metric("Concurrent reconciliation invocations rejected by the re-entrancy guard", "counter",
+		"orbit_reconciliation_rejected_total", p.ReconciliationRejected.Load())
+
+	metric("Successful Docker event-stream reconnects", "counter",
+		"orbit_eventsource_reconnects_total", p.EventSourceReconnects.Load())
+
+	metric("Failed Docker event-stream reconnect attempts", "counter",
+		"orbit_eventsource_reconnect_failures_total", p.EventSourceReconnectFailures.Load())
+
+	metric("Docker event messages received", "counter",
+		"orbit_eventsource_events_received_total", p.EventsReceived.Load())
+
+	metric("Received events outside the accepted action set (start/die/health_status)", "counter",
+		"orbit_eventsource_events_ignored_total", p.EventsIgnored.Load())
+
+	metric("Reconciliation passes started by the periodic tick", "counter",
+		"orbit_reconcile_triggered_periodic_total", p.ReconcileTriggeredByPeriodic.Load())
+
+	metric("Reconciliation passes started by a Docker event", "counter",
+		"orbit_reconcile_triggered_event_total", p.ReconcileTriggeredByEvent.Load())
+
+	metric("Reconciliation passes started by a stream reconnect", "counter",
+		"orbit_reconcile_triggered_reconnect_total", p.ReconcileTriggeredByReconnect.Load())
 
 	metric("Total registered backends including draining ones", "gauge",
 		"orbit_backends_total", backends)

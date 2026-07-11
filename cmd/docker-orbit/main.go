@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,8 +19,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,6 +34,7 @@ import (
 	"github.com/docker-secret-operator/orbit/internal/proxy"
 	"github.com/docker-secret-operator/orbit/internal/rollout"
 	"github.com/docker-secret-operator/orbit/internal/state"
+	"github.com/docker/docker/client"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
@@ -104,6 +108,7 @@ Example:
 
 func generateCmd(log *zap.Logger) *cobra.Command {
 	var input, output string
+	var sharedProxy bool
 
 	cmd := &cobra.Command{
 		Use:   "generate",
@@ -121,16 +126,32 @@ Auto-detection rules (per service, first match wins):
   3. Known database image    → pass through (with warning)
   4. Everything else         → proxy injected
 
+--shared-proxy generates a single shared proxy fronting every eligible
+service instead of one proxy per service (ADR-0006), plus a
+docker-rollout-services.json companion file the shared proxy reads at
+startup. Opt-in and off by default — omitting the flag produces exactly
+the same output as before, so existing deployments are never silently
+switched to the new topology by regenerating. Only the default service
+(the first, alphabetically, among those proxied) is reachable via
+unscoped 'docker orbit rollout/recover/status --control-addr' today —
+targeting any other service through the shared proxy's control API
+requires the service-scoped routes, not yet implemented.
+
 Example:
   docker orbit generate
-  docker orbit generate --file docker-compose.prod.yml --output docker-rollout-compose.prod.yml`,
+  docker orbit generate --file docker-compose.prod.yml --output docker-rollout-compose.prod.yml
+  docker orbit generate --shared-proxy`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cf, err := compose.ParseFile(input)
 			if err != nil {
 				return fmt.Errorf("generate: %w", err)
 			}
 
-			out, sum, err := compose.Generate(cf)
+			generate := compose.Generate
+			if sharedProxy {
+				generate = compose.GenerateShared
+			}
+			out, sum, err := generate(cf)
 			if err != nil {
 				return fmt.Errorf("generate: %w", err)
 			}
@@ -150,13 +171,54 @@ Example:
 				return fmt.Errorf("generate: write %s: %w", output, err)
 			}
 			fmt.Fprintf(os.Stderr, "\nGenerated: %s\n", output)
+
+			if sharedProxy && len(sum.SharedProxyBinds) > 0 {
+				servicesPath := filepath.Join(filepath.Dir(output), compose.SharedServicesConfigFileName)
+				if err := writeServicesConfig(servicesPath, sum.SharedProxyBinds); err != nil {
+					return fmt.Errorf("generate: write %s: %w", servicesPath, err)
+				}
+				fmt.Fprintf(os.Stderr, "Generated: %s (shared proxy, %d service(s))\n", servicesPath, len(sum.Proxied))
+			}
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVarP(&input, "file", "f", "docker-compose.yml", "Input compose file")
 	cmd.Flags().StringVarP(&output, "output", "o", "docker-rollout-compose.yml", "Output file path")
+	cmd.Flags().BoolVar(&sharedProxy, "shared-proxy", false, "Generate a single shared proxy fronting every eligible service, instead of one proxy per service (ADR-0006)")
 	return cmd
+}
+
+// writeServicesConfig builds a config.ServicesConfig from the per-service
+// port bindings compose.GenerateShared returns (grouped by service,
+// sorted for deterministic file output) and writes it as indented JSON —
+// the exact shape internal/config.ResolveServicesConfig reads at shared-
+// proxy startup, read-only-mounted into the container this same generate
+// invocation just wrote a volume entry for.
+func writeServicesConfig(path string, binds []compose.PortBinding) error {
+	byService := make(map[string][]config.PortBinding)
+	for _, b := range binds {
+		byService[b.Service] = append(byService[b.Service], config.PortBinding{
+			ListenPort: b.ListenPort,
+			TargetPort: b.TargetPort,
+		})
+	}
+	names := make([]string, 0, len(byService))
+	for name := range byService {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	sc := config.ServicesConfig{Services: make([]config.ServiceConfig, 0, len(names))}
+	for _, name := range names {
+		sc.Services = append(sc.Services, config.ServiceConfig{Name: name, Binds: byService[name]})
+	}
+
+	data, err := json.MarshalIndent(sc, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal services config: %w", err)
+	}
+	return os.WriteFile(path, data, 0o644)
 }
 
 // ── rollout ───────────────────────────────────────────────────────────────────
@@ -417,6 +479,48 @@ func runProxy(log *zap.Logger, version string) error {
 		log.Info("runtime: continuous health controller activated via feature gate")
 	}
 
+	// ADR-0006 Stage 4: Reconciler (PR 4.2, unchanged by this stage) is a
+	// second, independent membership-convergence mechanism layered on top
+	// of the existing recovery loop (executeRecoveryForProject, unchanged,
+	// above) — the periodic safety net that corrects whatever the events
+	// fast path below misses. Purely additive: it only ever adds/removes
+	// backends to match Docker's current container membership, never
+	// evicts on health or changes a routing decision, so — unlike
+	// FeatureContinuousHealth above — it does not go through the
+	// RuntimeFeatures activation gate.
+	//
+	// PR 4.3 adds EventSource: Docker Events as a notification mechanism,
+	// never a source of truth (INV-4) — it only ever decides *when*
+	// Reconciler.ReconcileOnce runs sooner, never mutates a Registry
+	// itself. EventSource now owns the periodic tick that used to be
+	// Reconciler.Run's job (still valid, still tested, just no longer the
+	// production driver) — this is the single serialization point a
+	// second reconciliation trigger requires: one goroutine, one select
+	// loop, so ReconcileOnce can never run concurrently with itself.
+	//
+	// PR 4.4: eventSourceWG is waited on before reconcilerDocker.Close()
+	// fires (below, at shutdown) — es.Run stopping when ctx is cancelled
+	// is necessary but not sufficient, since "stops eventually" and
+	// "closing the client it's still using is now safe" are different
+	// claims. Without this, Close() could run concurrently with es.Run
+	// still mid-ReconcileOnce, closing the Docker client out from under
+	// it.
+	var eventSourceWG sync.WaitGroup
+	reconcilerDocker, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		log.Warn("runtime: reconciler NOT activated (docker client unavailable)", zap.Error(err))
+	} else {
+		defer reconcilerDocker.Close() //nolint:errcheck // deferred docker client close on shutdown; error not actionable
+		rc := proxy.NewReconciler(pr, reconcilerDocker, m, log)
+		es := proxy.NewEventSource(rc, reconcilerDocker, cfg.ReconcileInterval, m, log)
+		eventSourceWG.Add(1)
+		go func() {
+			defer eventSourceWG.Done()
+			es.Run(ctx) // stops when the shutdown signal cancels ctx
+		}()
+		log.Info("runtime: reconciler + event source activated", zap.Duration("periodic_interval", cfg.ReconcileInterval))
+	}
+
 	// Periodic rediscovery. HealthController (above) only re-checks backends
 	// already in the registry — by its own Layer 5 contract it must never
 	// touch Docker lifecycle — so a service that never got past initial
@@ -467,6 +571,14 @@ func runProxy(log *zap.Logger, version string) error {
 			zap.Error(err))
 		srv.Close()
 	}
+
+	// Wait for EventSource to actually stop — not just for ctx to be
+	// cancelled — before the deferred reconcilerDocker.Close() above runs.
+	// EventSource logs "eventsource: stopped" itself once this returns.
+	// No fixed timeout: shutdown is bounded by cfg.DrainTimeout above and
+	// by ReconcileOnce's own bounded Docker calls, not by anything this
+	// wait could hang on indefinitely on its own.
+	eventSourceWG.Wait()
 
 	log.Info("proxy: shutdown complete")
 	return nil
