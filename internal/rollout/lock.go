@@ -35,6 +35,9 @@ type FileLock struct {
 // Returns error if lock exists and process is alive.
 // Removes lock if process is dead.
 func AcquireLock(service string) (*FileLock, error) {
+	if err := validateServiceNameForCLIArg(service); err != nil {
+		return nil, err
+	}
 	lockPath := LockPath(service)
 	hostname, _ := os.Hostname()
 
@@ -106,6 +109,9 @@ func AcquireLock(service string) (*FileLock, error) {
 
 // AcquireLockForce forcefully removes stale lock if process is confirmed dead.
 func AcquireLockForce(service string) (*FileLock, error) {
+	if err := validateServiceNameForCLIArg(service); err != nil {
+		return nil, err
+	}
 	lockPath := LockPath(service)
 
 	// Read existing lock.

@@ -1265,15 +1265,24 @@ func versionCmd() *cobra.Command {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func writeComposeFile(path string, cf *compose.ComposeFile) error {
-	f, err := os.Create(path)
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // no-op once the rename below succeeds
 
-	enc := yaml.NewEncoder(f)
+	enc := yaml.NewEncoder(tmp)
 	enc.SetIndent(4)
-	return enc.Encode(cf)
+	if err := enc.Encode(cf); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func doGet(url string) (string, error) {

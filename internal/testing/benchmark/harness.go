@@ -264,4 +264,3 @@ func (ltr *LoadTestResult) String() string {
 		ltr.P99Latency,
 	)
 }
-

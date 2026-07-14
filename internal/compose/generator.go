@@ -574,19 +574,33 @@ func parsePort(s string) (host, container int, err error) {
 		if e != nil {
 			return 0, 0, fmt.Errorf("invalid port number %q", parts[0])
 		}
+		if !isValidPort(n) {
+			return 0, 0, fmt.Errorf("port %d out of range (1-65535)", n)
+		}
 		return n, n, nil
 	case 2:
 		h, e := strconv.Atoi(parts[0])
 		if e != nil {
 			return 0, 0, fmt.Errorf("invalid host port %q", parts[0])
 		}
+		if !isValidPort(h) {
+			return 0, 0, fmt.Errorf("host port %d out of range (1-65535)", h)
+		}
 		c, e := strconv.Atoi(parts[1])
 		if e != nil {
 			return 0, 0, fmt.Errorf("invalid container port %q", parts[1])
 		}
+		if !isValidPort(c) {
+			return 0, 0, fmt.Errorf("container port %d out of range (1-65535)", c)
+		}
 		return h, c, nil
 	}
 	return 0, 0, fmt.Errorf("unrecognised port format %q", s)
+}
+
+// isValidPort reports whether n is a valid TCP/UDP port number.
+func isValidPort(n int) bool {
+	return n >= 1 && n <= 65535
 }
 
 func appendUnique(s []string, v string) []string {

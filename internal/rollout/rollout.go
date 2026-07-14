@@ -158,6 +158,14 @@ type RolloutState struct {
 	APIToken     string        `json:"api_token,omitempty"`
 	Drain        time.Duration `json:"drain_ns"`
 	StartedAt    time.Time     `json:"started_at"`
+
+	// VolumeSnapshots is the captured volume snapshot metadata for this
+	// service's transition (internal/volumes.PersistSnapshots' output,
+	// keyed by mount path), if any volumes were discovered. Persisted here
+	// so `docker orbit rollback` — normally a fresh process, with no live
+	// VolumeCoordinator from the Run that captured this — can still restore
+	// volumes. Empty/nil for stateless services.
+	VolumeSnapshots map[string]interface{} `json:"volume_snapshots,omitempty"`
 }
 
 // Runtime abstracts container runtime operations used by rollout orchestration.
@@ -203,6 +211,7 @@ type runDeps struct {
 	runtime Runtime
 	control ControlAPI
 	state   StateStore
+	volumes VolumeManager // nil is valid — see runWithDeps' nil guard
 }
 
 // serviceNamePattern mirrors the constraint Docker Compose already places on
@@ -242,6 +251,9 @@ func saveState(s RolloutState) error {
 // LoadState reads the last rollout state for the given service so Rollback can
 // consume it. Returns an error if no state file exists.
 func LoadState(service string) (RolloutState, error) {
+	if err := validateServiceNameForCLIArg(service); err != nil {
+		return RolloutState{}, err
+	}
 	data, err := os.ReadFile(statePath(service))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -289,7 +301,7 @@ func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 		log.Warn("history: could not record rollout start (non-fatal)", zap.Error(err))
 	}
 
-	runErr := runWithDeps(ctx, opts, log, defaultRunDeps())
+	runErr := runWithDeps(ctx, opts, log, defaultRunDeps(log))
 
 	ev := history.Event{
 		Service:    opts.Service,
@@ -361,6 +373,25 @@ func runWithDeps(ctx context.Context, opts Options, log *zap.Logger, deps runDep
 			zap.Error(err))
 	}
 
+	// ── Step 4b: Prepare volumes (no-op for stateless services) ──────────
+	// Discovers the service's volumes, snapshots their metadata, and mounts
+	// the old container's volumes read-only so it can't race the already-
+	// running new container on writes. Must happen before the new backend
+	// is registered (Step 5) — once traffic can reach the new container,
+	// both would be free to write the same volume unprotected.
+	var volumeCoordinator VolumeCoordinator = noopVolumeCoordinator{}
+	if deps.volumes != nil {
+		volumeCoordinator = deps.volumes.NewCoordinator(opts.Service)
+	}
+	if err := volumeCoordinator.PrepareForRollout(ctx, oldID); err != nil {
+		_ = deps.runtime.ScaleService(ctx, opts.ComposeFile, opts.Service, currentReplicas)
+		return fmt.Errorf("rollout: prepare volumes for %s: %w", opts.Service, err)
+	}
+	if err := volumeCoordinator.ValidateNewContainer(ctx, newID); err != nil {
+		_ = deps.runtime.ScaleService(ctx, opts.ComposeFile, opts.Service, currentReplicas)
+		return fmt.Errorf("rollout: validate new container volumes for %s: %w", opts.Service, err)
+	}
+
 	// ── Step 5: Register new backend with proxy ───────────────────────────
 	newBackendID := opts.Service + "-" + shortID(newID)
 	opts.report(PhaseRegistering, fmt.Sprintf("registering backend %s (%s)", newBackendID, newAddr))
@@ -382,15 +413,16 @@ func runWithDeps(ctx context.Context, opts Options, log *zap.Logger, deps runDep
 		}
 	}
 	_ = deps.state.Save(RolloutState{
-		Service:      opts.Service,
-		OldBackendID: oldBackendID,
-		OldAddr:      oldAddr,
-		NewBackendID: newBackendID,
-		NewAddr:      newAddr,
-		ControlAddr:  opts.ControlAddr,
-		APIToken:     opts.APIToken,
-		Drain:        opts.Drain,
-		StartedAt:    time.Now(),
+		Service:         opts.Service,
+		OldBackendID:    oldBackendID,
+		OldAddr:         oldAddr,
+		NewBackendID:    newBackendID,
+		NewAddr:         newAddr,
+		ControlAddr:     opts.ControlAddr,
+		APIToken:        opts.APIToken,
+		Drain:           opts.Drain,
+		StartedAt:       time.Now(),
+		VolumeSnapshots: volumeCoordinator.GetSnapshotsForPersistence(),
 	})
 
 	// ── Step 6b: Verify new backend stability before touching the old one ──
@@ -404,6 +436,10 @@ func runWithDeps(ctx context.Context, opts Options, log *zap.Logger, deps runDep
 			zap.Error(err))
 		opts.report(PhaseRollingBack, fmt.Sprintf("%s failed stability check: %v", newBackendID, err))
 
+		if verr := volumeCoordinator.Rollback(ctx); verr != nil {
+			log.Warn("rollout: volume rollback during auto-rollback failed",
+				zap.String("backend_id", newBackendID), zap.Error(verr))
+		}
 		if derr := deps.control.DeregisterBackend(ctx, opts, newBackendID, log); derr != nil {
 			log.Warn("rollout: could not deregister failed backend during auto-rollback",
 				zap.String("id", newBackendID), zap.Error(derr))
@@ -428,6 +464,15 @@ func runWithDeps(ctx context.Context, opts Options, log *zap.Logger, deps runDep
 	if err := deps.control.MarkTransitioning(ctx, opts, oldBackendID, newBackendID, log); err != nil {
 		log.Warn("rollout: could not persist authority transition (non-fatal, recovery will infer instead)",
 			zap.Error(err))
+	}
+
+	// Finalize the volume transition now too — same reasoning as
+	// MarkTransitioning above: traffic has already committed to the new
+	// backend, so a cleanup failure here (stale temp snapshot state) is
+	// non-fatal, not a reason to abort an otherwise-successful rollout.
+	if err := volumeCoordinator.CompleteTransition(ctx); err != nil {
+		log.Warn("rollout: volume transition cleanup had issues (non-fatal)",
+			zap.String("service", opts.Service), zap.Error(err))
 	}
 
 	// ── Step 7: Drain old connections ─────────────────────────────────────
@@ -545,6 +590,13 @@ type RollbackProgressFunc func(phase RollbackPhase, detail string)
 // after a successful rollback. progress, if non-nil, is called at each step
 // below — purely additive instrumentation, matching Options.Progress for Run.
 func Rollback(ctx context.Context, state RolloutState, log *zap.Logger, progress RollbackProgressFunc) (err error) {
+	return rollbackWithVolumeManager(ctx, state, log, progress, newVolumeManager(log))
+}
+
+// rollbackWithVolumeManager is Rollback's testable core — volMgr is injected
+// so tests can substitute a fake instead of constructing a real Docker
+// client.
+func rollbackWithVolumeManager(ctx context.Context, state RolloutState, log *zap.Logger, progress RollbackProgressFunc, volMgr VolumeManager) (err error) {
 	report := func(phase RollbackPhase, detail string) {
 		if progress != nil {
 			progress(phase, detail)
@@ -601,6 +653,23 @@ func Rollback(ctx context.Context, state RolloutState, log *zap.Logger, progress
 		log.Info("rollback: old backend already registered", zap.String("id", state.OldBackendID))
 	} else {
 		log.Info("rollback: old backend restored", zap.String("id", state.OldBackendID))
+	}
+
+	// Restore the old backend's volumes (read-write mode) from the snapshot
+	// metadata Run persisted — this process may not be the one that ran Run,
+	// so there is no live VolumeCoordinator to fall back on. No-op if the
+	// service had no volumes. Best-effort: traffic is already restored to
+	// the old backend above regardless of whether this succeeds.
+	if len(state.VolumeSnapshots) > 0 {
+		if volMgr == nil {
+			log.Warn("rollback: volume snapshots recorded but no volume manager available to restore them",
+				zap.String("service", state.Service))
+		} else if verr := volMgr.RestoreFromPersisted(ctx, state.VolumeSnapshots); verr != nil {
+			log.Warn("rollback: volume restore had issues (traffic already restored to old backend)",
+				zap.String("service", state.Service), zap.Error(verr))
+		} else {
+			log.Info("rollback: volumes restored from persisted snapshots", zap.String("service", state.Service))
+		}
 	}
 
 	// Drain the new (failing) backend.
@@ -709,11 +778,12 @@ type fileStateStore struct{}
 func (fileStateStore) Save(state RolloutState) error { return saveState(state) }
 func (fileStateStore) Clear(service string)          { clearState(service) }
 
-func defaultRunDeps() runDeps {
+func defaultRunDeps(log *zap.Logger) runDeps {
 	return runDeps{
 		runtime: dockerRuntime{},
 		control: httpControlAPI{},
 		state:   fileStateStore{},
+		volumes: newVolumeManager(log),
 	}
 }
 

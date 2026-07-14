@@ -45,10 +45,10 @@ func (m *MockDockerClient) VolumeInspect(ctx context.Context, name string) (volu
 // fakeCommandRunner records invocations and returns configured results instead
 // of touching the real Docker daemon.
 type fakeCommandRunner struct {
-	calls   [][]string
-	err     error
-	errFor  map[string]error // keyed by strings.Join(args, " ")
-	stdout  []byte           // written to the caller's stdout writer, if any
+	calls  [][]string
+	err    error
+	errFor map[string]error // keyed by strings.Join(args, " ")
+	stdout []byte           // written to the caller's stdout writer, if any
 }
 
 func (f *fakeCommandRunner) Run(ctx context.Context, stdout io.Writer, name string, args ...string) error {
@@ -714,6 +714,30 @@ func TestTemporarySnapshot_RunnerFails_ReturnsErrorAndNoFile(t *testing.T) {
 	}
 	if snapshotPath != "" {
 		t.Fatalf("expected empty snapshot path on failure, got %q", snapshotPath)
+	}
+}
+
+func TestTemporarySnapshot_RejectsPathTraversalVolumeName(t *testing.T) {
+	logger, _ := zap.NewProduction()
+	defer logger.Sync()
+
+	mock := &MockDockerClient{}
+	vm := NewVolumeManager(mock, logger)
+	fake := &fakeCommandRunner{stdout: []byte("fake-tarball-bytes")}
+	vm.runner = fake
+	ctx := context.Background()
+
+	for _, name := range []string{"../../etc/cron.d/evil", "..", ".", "foo/bar", ""} {
+		snapshotPath, err := vm.TemporarySnapshot(ctx, name)
+		if err == nil {
+			t.Errorf("TemporarySnapshot(%q) expected error, got snapshot path %q", name, snapshotPath)
+		}
+		if snapshotPath != "" {
+			t.Errorf("TemporarySnapshot(%q) expected empty path on rejection, got %q", name, snapshotPath)
+		}
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("expected no runner calls for rejected volume names, got %v", fake.calls)
 	}
 }
 

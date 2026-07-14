@@ -6,10 +6,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"go.uber.org/zap"
 )
+
+// validVolumeName matches Docker's own volume-naming rule and rejects
+// anything that could turn volumeName into a path-traversal segment when
+// interpolated into TemporarySnapshot's snapshot file path.
+var validVolumeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
 // PreventConcurrentAccess mounts the old container's volume as read-only to prevent
 // concurrent writes during rollout. This is the primary safeguard against data corruption.
@@ -55,6 +61,10 @@ func (vm *VolumeManager) PreventConcurrentAccess(ctx context.Context, containerI
 // snapshot file, which is only returned once its contents are confirmed
 // non-empty.
 func (vm *VolumeManager) TemporarySnapshot(ctx context.Context, volumeName string) (snapshotPath string, err error) {
+	if !validVolumeName.MatchString(volumeName) {
+		return "", fmt.Errorf("invalid volume name %q for snapshot", volumeName)
+	}
+
 	vm.log.Info("creating temporary snapshot",
 		zap.String("volume", volumeName))
 

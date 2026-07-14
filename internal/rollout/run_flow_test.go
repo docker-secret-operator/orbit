@@ -95,12 +95,14 @@ func (f *fakeControl) DeregisterBackend(_ context.Context, _ Options, id string,
 }
 
 type fakeStateStore struct {
-	saved   bool
-	cleared bool
+	saved     bool
+	cleared   bool
+	lastSaved RolloutState
 }
 
-func (f *fakeStateStore) Save(RolloutState) error {
+func (f *fakeStateStore) Save(s RolloutState) error {
 	f.saved = true
+	f.lastSaved = s
 	return nil
 }
 func (f *fakeStateStore) Clear(string) { f.cleared = true }
