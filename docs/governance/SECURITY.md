@@ -21,6 +21,10 @@ From the Product Contract in [CONSTITUTION.md](../../CONSTITUTION.md#product-con
 
 **Note on the unauthenticated-by-default control API**: this is an intentional tradeoff, not an oversight — the control API is meant to be reachable only from `orbit.io`-labeled containers on the internal Docker network (`docker_rollout_mesh`), not exposed to the host network by default. Anyone deploying Orbit with the control port exposed to an untrusted network should set `ORBIT_API_TOKEN`.
 
+## Known Limitations
+
+**Stateful services get no volume protection during rollout.** `internal/volumes` implements pre-rollout snapshot, read-only remount, and rollback-on-failure for a stateful service's Docker volumes — but as of 2026-07-14, `internal/rollout.Run`/`Rollback` never call it. Rolling out a stateful service (a database, anything with a Docker volume whose contents matter) gets the same zero-downtime backend-swap safety as any other service, but **no** volume-level protection: no snapshot before the swap, no rollback of volume state if the new container corrupts or loses data. This was a deliberate scoping decision (see [GO-LIVE-SECURITY-AUDIT-2026-07-14.md](../adr/GO-LIVE-SECURITY-AUDIT-2026-07-14.md), finding C3) — wiring it up is real integration work, not a rushed add-on. Until it's wired in, treat stateful-service rollouts as carrying the same volume risk as a manual `docker compose up --force-recreate` would.
+
 ## Dependency Scanning
 
 As of this document, CI runs [`govulncheck`](https://github.com/golang/vuln) on every push/PR (`.github/workflows/ci.yml`) — it did not before. A scan at the time this was added found:

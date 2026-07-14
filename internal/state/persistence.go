@@ -336,6 +336,10 @@ func (sm *StateManager) LoadActiveGenerationState(service string) (*ActiveGenera
 // WriteActiveGenerationState writes active generation state with locking.
 // Uses CAS (Compare-And-Swap) semantics via revision numbers.
 func (sm *StateManager) WriteActiveGenerationState(state *ActiveGenerationState, log interface{}) error {
+	if err := ValidateActiveGenerationStateNotEmpty(state); err != nil {
+		return fmt.Errorf("refusing to write invalid active generation state: %w", err)
+	}
+
 	lockPath := sm.StateLockPath(state.Service)
 
 	// Acquire exclusive write lock
@@ -360,8 +364,11 @@ func (sm *StateManager) WriteActiveGenerationState(state *ActiveGenerationState,
 		}
 	}
 
-	// Safe to write: increment revision
-	state.Revision = time.Now().Unix() // Use timestamp as monotonic counter
+	// Safe to write: bump revision. UnixNano (not Unix) — mirrors
+	// WriteRolloutState 80 lines below: a 1-second-resolution counter would
+	// let two writes in the same second collide on the same revision,
+	// silently defeating the CAS check that depends on it.
+	state.Revision = time.Now().UnixNano()
 	if current != nil {
 		state.PreviousRevision = current.Revision
 	}
@@ -420,6 +427,10 @@ func (sm *StateManager) LoadRolloutState(service string) (*RolloutState, error) 
 // Uses CAS (Compare-And-Swap) semantics via revision numbers, mirroring
 // WriteActiveGenerationState.
 func (sm *StateManager) WriteRolloutState(state *RolloutState, log interface{}) error {
+	if err := ValidateRolloutStateConsistency(state); err != nil {
+		return fmt.Errorf("refusing to write invalid rollout state: %w", err)
+	}
+
 	lockPath := sm.StateLockPath(state.Service)
 
 	lock, err := AcquireAdvisoryLock(lockPath, 5*time.Second)

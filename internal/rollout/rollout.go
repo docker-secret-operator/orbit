@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -204,6 +205,28 @@ type runDeps struct {
 	state   StateStore
 }
 
+// serviceNamePattern mirrors the constraint Docker Compose already places on
+// service names (internal/config.serviceNamePattern uses the same rule for
+// services.json). Applied here as a CLI-argument-injection guard: scaleService
+// and composeRun pass the service name as the final, unguarded positional
+// argument to `docker compose`, so a name starting with "-" (e.g. a compose
+// file service key literally named "--force-recreate") would be parsed by
+// docker compose's own flag parser as a flag rather than a service name.
+var serviceNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+
+// validateServiceNameForCLIArg rejects a service name before it can reach
+// any `docker`/`docker compose` invocation as a trailing positional
+// argument. Called once, at the top of runWithDeps and Rollback — the two
+// entry points above every exec.Command call site in this package —
+// rather than at each individual call site.
+func validateServiceNameForCLIArg(service string) error {
+	if !serviceNamePattern.MatchString(service) {
+		return fmt.Errorf("rollout: service name %q is not a safe docker compose CLI argument (must match %s)",
+			service, serviceNamePattern.String())
+	}
+	return nil
+}
+
 func statePath(service string) string {
 	return fmt.Sprintf("/tmp/orbit-%s-state.json", service)
 }
@@ -288,6 +311,10 @@ func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 }
 
 func runWithDeps(ctx context.Context, opts Options, log *zap.Logger, deps runDeps) error {
+	if err := validateServiceNameForCLIArg(opts.Service); err != nil {
+		return err
+	}
+
 	log.Info("rollout: starting",
 		zap.String("service", opts.Service),
 		zap.String("compose", opts.ComposeFile))
@@ -526,6 +553,9 @@ func Rollback(ctx context.Context, state RolloutState, log *zap.Logger, progress
 
 	if state.OldBackendID == "" || state.OldAddr == "" {
 		return fmt.Errorf("rollback: no old backend recorded in state — cannot roll back")
+	}
+	if err := validateServiceNameForCLIArg(state.Service); err != nil {
+		return err
 	}
 	start := time.Now()
 

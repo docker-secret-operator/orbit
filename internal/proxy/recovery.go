@@ -145,6 +145,13 @@ func (d *DockerRecoverySource) DiscoverAndValidateBackends(ctx context.Context) 
 		}
 	}
 
+	// Index by backend ID (not container ID) for buildGenerationInventory,
+	// which only ever sees BackendHealth.ID — see RecoveryResult.BackendCreatedAt.
+	result.BackendCreatedAt = make(map[string]time.Time, len(containerMap))
+	for _, b := range containerMap {
+		result.BackendCreatedAt[b.ID] = b.Created
+	}
+
 	// Validate health for all discovered backends.
 	healthResults := d.healthValidator.BatchCheck(ctx, containerMap)
 	result.Backends = healthResults
@@ -282,6 +289,7 @@ func (d *DockerRecoverySource) extractBackend(ctx context.Context, c types.Conta
 		ID:         backendID,
 		Addr:       addr,
 		Generation: generation,
+		Created:    time.Unix(c.Created, 0),
 	}, nil
 }
 

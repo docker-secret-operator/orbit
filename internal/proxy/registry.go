@@ -66,6 +66,13 @@ type Backend struct {
 	// AddedAt is set automatically by Registry.Add.
 	AddedAt time.Time `json:"added_at"`
 
+	// Created is the underlying Docker container's real creation time, set
+	// by DockerRecoverySource.extractBackend during discovery — distinct
+	// from AddedAt, which is when this proxy registered the backend (can be
+	// much later than the container actually started, e.g. after a proxy
+	// restart). Zero value if unknown (backend wasn't discovered from Docker).
+	Created time.Time `json:"created,omitempty"`
+
 	// LastStateChange records the time of the most recent State transition.
 	LastStateChange time.Time `json:"last_state_change,omitempty"`
 

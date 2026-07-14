@@ -410,12 +410,13 @@ func selectBackendsToRestore(
 			for _, backend := range byGeneration[drainingGen] {
 				if backend.Health == "healthy" {
 					cand := BackendCandidate{
-						Generation:  drainingGen,
-						ID:          backend.ID,
-						Addr:        backend.Addr,
-						Health:      backend.Health,
-						TrafficRole: TrafficRoleDraining,
-						Reason:      "interrupted rollout: finishing existing connections",
+						Generation:     drainingGen,
+						ID:             backend.ID,
+						Addr:           backend.Addr,
+						Health:         backend.Health,
+						TrafficRole:    TrafficRoleDraining,
+						Reason:         "interrupted rollout: finishing existing connections",
+						ValidityStatus: CandidateValid,
 					}
 					candidates = append(candidates, cand)
 				}

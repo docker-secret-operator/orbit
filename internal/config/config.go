@@ -189,8 +189,12 @@ func validateStateDir(stateDir string) error {
 	info, err := os.Stat(stateDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Try to create it
-			if err := os.MkdirAll(stateDir, 0755); err != nil {
+			// Try to create it. 0700 (not 0755): files inside are 0600 but
+			// the directory itself must not be world-readable/executable —
+			// otherwise any local user on a shared host can enumerate
+			// service names and deployment timing via directory listing,
+			// matching internal/history's own state directory permissions.
+			if err := os.MkdirAll(stateDir, 0700); err != nil {
 				return fmt.Errorf("directory does not exist and cannot be created: %w", err)
 			}
 			return nil

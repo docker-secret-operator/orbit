@@ -473,6 +473,92 @@ func TestWriteRolloutState_FirstWrite_Succeeds(t *testing.T) {
 	}
 }
 
+// TestWriteRolloutState_IdenticalGenerations_Rejected closes the go-live
+// audit's finding H3: internal/state/invariants.go's checkRolloutConsistency
+// was fully implemented and unit-tested but never wired into any production
+// write path — internal/api/authority.go's handlers construct RolloutState
+// directly from HTTP request bodies and call WriteRolloutState with nothing
+// in between, so a malformed state (e.g. OldGeneration == NewGeneration)
+// would write successfully. WriteRolloutState must reject it instead.
+func TestWriteRolloutState_IdenticalGenerations_Rejected(t *testing.T) {
+	tmpDir := t.TempDir()
+	sm := NewStateManager(tmpDir, nil)
+
+	rs := &RolloutState{
+		SchemaVersion: 1,
+		Service:       "web",
+		OldGeneration: "gen-1",
+		NewGeneration: "gen-1", // invalid: identical generations
+		Phase:         RolloutDraining,
+		Authority:     AuthorityOld,
+	}
+
+	if err := sm.WriteRolloutState(rs, nil); err == nil {
+		t.Fatal("WriteRolloutState should reject a RolloutState with identical Old/NewGeneration")
+	}
+
+	if loaded, _ := sm.LoadRolloutState("web"); loaded != nil {
+		t.Errorf("rejected write must not persist anything, but a rollout state was loaded: %+v", loaded)
+	}
+}
+
+// TestWriteActiveGenerationState_EmptyGeneration_Rejected is the
+// ActiveGenerationState half of the same H3 gap: WriteActiveGenerationState
+// must reject a blank ActiveGeneration rather than persist it silently.
+func TestWriteActiveGenerationState_EmptyGeneration_Rejected(t *testing.T) {
+	tmpDir := t.TempDir()
+	sm := NewStateManager(tmpDir, nil)
+
+	ags := &ActiveGenerationState{
+		SchemaVersion:    1,
+		Service:          "web",
+		ActiveGeneration: "", // invalid: empty authority
+	}
+
+	if err := sm.WriteActiveGenerationState(ags, nil); err == nil {
+		t.Fatal("WriteActiveGenerationState should reject an empty ActiveGeneration")
+	}
+
+	if loaded, _ := sm.LoadActiveGenerationState("web"); loaded != nil {
+		t.Errorf("rejected write must not persist anything, but active generation state was loaded: %+v", loaded)
+	}
+}
+
+// TestWriteActiveGenerationState_RapidWrites_RevisionsNeverCollide closes
+// the go-live audit's finding M3: WriteActiveGenerationState used
+// time.Now().Unix() (second resolution) for its CAS Revision field, while
+// WriteRolloutState — 80 lines away in this same file — explicitly
+// documents and avoids this exact hazard using UnixNano(), since two
+// writes landing in the same wall-clock second would collide on the same
+// revision and silently defeat the CAS check a later writer's
+// PreviousRevision depends on (a lost update). Several rapid successive
+// writes (which reliably land in the same second on any real test
+// machine) must still produce strictly increasing, non-colliding
+// revisions.
+func TestWriteActiveGenerationState_RapidWrites_RevisionsNeverCollide(t *testing.T) {
+	tmpDir := t.TempDir()
+	sm := NewStateManager(tmpDir, nil)
+
+	var prev int64
+	seen := map[int64]bool{}
+	for i := 0; i < 5; i++ {
+		ags := &ActiveGenerationState{
+			SchemaVersion:    1,
+			Service:          "web",
+			ActiveGeneration: "gen-1",
+			PreviousRevision: prev,
+		}
+		if err := sm.WriteActiveGenerationState(ags, nil); err != nil {
+			t.Fatalf("write %d failed: %v", i, err)
+		}
+		if seen[ags.Revision] {
+			t.Fatalf("write %d produced a Revision (%d) that collided with an earlier write — same-second CAS collision, a lost update is now possible", i, ags.Revision)
+		}
+		seen[ags.Revision] = true
+		prev = ags.Revision
+	}
+}
+
 func TestWriteRolloutState_StaleWrite_Rejected(t *testing.T) {
 	tmpDir := t.TempDir()
 	sm := NewStateManager(tmpDir, nil)

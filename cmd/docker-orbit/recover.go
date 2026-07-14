@@ -55,12 +55,12 @@ Example:
   docker orbit recover --control-addr http://localhost:9901`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p := output.New(cmd.OutOrStdout(), jsonOut)
-			return runRecover(cmd, p, controlAddr, apiToken, project, timeout, log)
+			return runRecover(cmd, p, controlAddr, resolveAPIToken(apiToken), project, timeout, log)
 		},
 	}
 
 	cmd.Flags().StringVar(&controlAddr, "control-addr", "http://localhost:9900", "Proxy control API address")
-	cmd.Flags().StringVar(&apiToken, "api-token", os.Getenv("ORBIT_API_TOKEN"), "Control API bearer token")
+	cmd.Flags().StringVar(&apiToken, "api-token", "", "Control API bearer token (falls back to ORBIT_API_TOKEN)")
 	cmd.Flags().StringVar(&project, "project", "", "Verify the queried proxy reports this service/project name")
 	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "Maximum time to wait for the recovery pass (Docker discovery + health checks can take longer than a typical status query)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output as JSON")

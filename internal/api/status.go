@@ -123,10 +123,10 @@ func BuildStatusReport(ctx context.Context, service, version string, startupStat
 	}
 
 	if dh != nil {
-		if activeGen := dh.activeGenState(); activeGen != nil {
+		if activeGen := dh.activeGenState(service); activeGen != nil {
 			report.CurrentGeneration = activeGen.ActiveGeneration
 		}
-		if rs := dh.rolloutState(); rs != nil {
+		if rs := dh.rolloutState(service); rs != nil {
 			report.PreviousGeneration = rs.OldGeneration
 			report.DeploymentState = string(rs.Phase)
 		}

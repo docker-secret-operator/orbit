@@ -126,6 +126,33 @@ func (v *InvariantValidator) Violations() []string {
 	return v.violations
 }
 
+// ValidateRolloutStateConsistency checks the structural invariants a
+// RolloutState must satisfy on its own — its two generations must differ,
+// and its Authority field must be a recognized value. Unlike
+// InvariantValidator.ValidateAll, this needs no sibling state
+// (ActiveGenerationState, GenerationInventory) that isn't available at
+// every call site, so it's the check WriteRolloutState runs on every write,
+// not just wherever full system context happens to be on hand.
+func ValidateRolloutStateConsistency(rollout *RolloutState) error {
+	v := &InvariantValidator{rollout: rollout}
+	v.checkRolloutConsistency()
+	if len(v.violations) > 0 {
+		return fmt.Errorf("invariant violations: %v", v.violations)
+	}
+	return nil
+}
+
+// ValidateActiveGenerationStateNotEmpty rejects writing an
+// ActiveGenerationState with a blank ActiveGeneration. See
+// ValidateRolloutStateConsistency for why this is a standalone,
+// single-struct check rather than InvariantValidator.ValidateAll.
+func ValidateActiveGenerationStateNotEmpty(activeGen *ActiveGenerationState) error {
+	if activeGen != nil && activeGen.ActiveGeneration == "" {
+		return fmt.Errorf("invariant violation: active generation empty")
+	}
+	return nil
+}
+
 // ValidateRecoveryPrerequisites checks system is safe for recovery
 func ValidateRecoveryPrerequisites(
 	inventory *GenerationInventory,

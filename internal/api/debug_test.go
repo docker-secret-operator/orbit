@@ -37,7 +37,7 @@ func TestDebugHandler(t *testing.T) {
 			"determined authority: gen-new",
 		},
 	}
-	dh.RecordRecoveryPlan(plan)
+	dh.RecordRecoveryPlan("web", plan)
 
 	// Test DebugMetrics
 	var buf bytes.Buffer
@@ -71,7 +71,7 @@ func TestDebugHandler(t *testing.T) {
 
 	// Test DebugDecisionTrace
 	buf.Reset()
-	if err := dh.DebugDecisionTrace(&buf); err != nil {
+	if err := dh.DebugDecisionTrace(&buf, "web"); err != nil {
 		t.Fatalf("DebugDecisionTrace failed: %v", err)
 	}
 
@@ -86,7 +86,7 @@ func TestDebugHandler(t *testing.T) {
 
 	// Test DebugFullStatus
 	buf.Reset()
-	if err := dh.DebugFullStatus(&buf); err != nil {
+	if err := dh.DebugFullStatus(&buf, "web"); err != nil {
 		t.Fatalf("DebugFullStatus failed: %v", err)
 	}
 
@@ -127,7 +127,7 @@ func TestDebugHandlerConcurrentRecordAndRead(t *testing.T) {
 				return
 			default:
 			}
-			dh.RecordRecoveryPlan(&state.RecoveryPlan{
+			dh.RecordRecoveryPlan("web", &state.RecoveryPlan{
 				Service: "web",
 				Epoch:   1,
 				Action:  state.RecoveryRestoreSingle,
@@ -135,8 +135,8 @@ func TestDebugHandlerConcurrentRecordAndRead(t *testing.T) {
 					"loaded state",
 				},
 			})
-			dh.RecordRolloutState(&state.RolloutState{OldGeneration: "web-1", NewGeneration: "web-2"})
-			dh.RecordActiveGenState(&state.ActiveGenerationState{ActiveGeneration: "web-2"})
+			dh.RecordRolloutState("web", &state.RolloutState{OldGeneration: "web-1", NewGeneration: "web-2"})
+			dh.RecordActiveGenState("web", &state.ActiveGenerationState{ActiveGeneration: "web-2"})
 		}
 	}
 
@@ -149,8 +149,8 @@ func TestDebugHandlerConcurrentRecordAndRead(t *testing.T) {
 			default:
 			}
 			var buf bytes.Buffer
-			_ = dh.DebugFullStatus(&buf)
-			_ = dh.DebugRolloutState(&buf)
+			_ = dh.DebugFullStatus(&buf, "web")
+			_ = dh.DebugRolloutState(&buf, "web")
 		}
 	}
 
@@ -171,7 +171,7 @@ func TestDebugRecoveryPlanNil(t *testing.T) {
 	dh := NewDebugHandler(sm, mc)
 
 	var buf bytes.Buffer
-	err := dh.DebugRecoveryPlan(&buf)
+	err := dh.DebugRecoveryPlan(&buf, "web")
 	if err == nil {
 		t.Error("should fail when no recovery plan recorded")
 	}
@@ -218,10 +218,10 @@ func TestDebugRolloutState(t *testing.T) {
 		Phase:         state.RolloutDraining,
 		Authority:     state.AuthorityTransitioning,
 	}
-	dh.RecordRolloutState(rollout)
+	dh.RecordRolloutState("web", rollout)
 
 	var buf bytes.Buffer
-	if err := dh.DebugRolloutState(&buf); err != nil {
+	if err := dh.DebugRolloutState(&buf, "web"); err != nil {
 		t.Fatalf("DebugRolloutState failed: %v", err)
 	}
 
@@ -244,7 +244,7 @@ func TestDebugGenerations(t *testing.T) {
 	mc.RecordAuthorityTransition("gen-b", "gen-c")
 
 	var buf bytes.Buffer
-	if err := dh.DebugGenerations(&buf); err != nil {
+	if err := dh.DebugGenerations(&buf, "web"); err != nil {
 		t.Fatalf("DebugGenerations failed: %v", err)
 	}
 

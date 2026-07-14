@@ -16,16 +16,23 @@ import (
 // RecordX methods are called from the recovery goroutine (proxy startup and
 // every POST /recover); the DebugX/BuildStatusReport readers are served from
 // concurrent HTTP handler goroutines (e.g. the unauthenticated GET /status
-// polled while a recovery is in flight). mu guards the three lastX pointer
-// fields against that concurrent read/write.
+// polled while a recovery is in flight). mu guards the three lastX maps
+// against that concurrent read/write.
+//
+// State is keyed by service name: a shared proxy runs recovery for every
+// configured service in one pass (see executeRecoveryForProject), and each
+// pass's RecordX call must not clobber another service's last-recorded
+// state — a single unkeyed field would make GET /status report whichever
+// service's recovery happened to run last, regardless of which service the
+// request is actually asking about.
 type DebugHandler struct {
 	stateManager     *state.StateManager
 	metricsCollector *metrics.MetricsCollector
 
 	mu                 sync.RWMutex
-	lastRecoveryPlan   *state.RecoveryPlan
-	lastRolloutState   *state.RolloutState
-	lastActiveGenState *state.ActiveGenerationState
+	lastRecoveryPlan   map[string]*state.RecoveryPlan
+	lastRolloutState   map[string]*state.RolloutState
+	lastActiveGenState map[string]*state.ActiveGenerationState
 }
 
 // NewDebugHandler creates a new debug handler
@@ -34,13 +41,17 @@ func NewDebugHandler(
 	mc *metrics.MetricsCollector,
 ) *DebugHandler {
 	return &DebugHandler{
-		stateManager:     sm,
-		metricsCollector: mc,
+		stateManager:       sm,
+		metricsCollector:   mc,
+		lastRecoveryPlan:   make(map[string]*state.RecoveryPlan),
+		lastRolloutState:   make(map[string]*state.RolloutState),
+		lastActiveGenState: make(map[string]*state.ActiveGenerationState),
 	}
 }
 
-// RecordRecoveryPlan stores the last recovery plan for debugging
-func (dh *DebugHandler) RecordRecoveryPlan(plan *state.RecoveryPlan) {
+// RecordRecoveryPlan stores the last recovery plan for debugging, keyed by
+// the service the recovery pass ran for.
+func (dh *DebugHandler) RecordRecoveryPlan(service string, plan *state.RecoveryPlan) {
 	if plan == nil {
 		return
 	}
@@ -50,58 +61,61 @@ func (dh *DebugHandler) RecordRecoveryPlan(plan *state.RecoveryPlan) {
 	copy(planCopy.DecisionTrace, plan.DecisionTrace)
 
 	dh.mu.Lock()
-	dh.lastRecoveryPlan = &planCopy
+	dh.lastRecoveryPlan[service] = &planCopy
 	dh.mu.Unlock()
 }
 
-// RecordRolloutState stores the last rollout state for debugging
-func (dh *DebugHandler) RecordRolloutState(rollout *state.RolloutState) {
+// RecordRolloutState stores the last rollout state for debugging, keyed by
+// the service the recovery pass ran for.
+func (dh *DebugHandler) RecordRolloutState(service string, rollout *state.RolloutState) {
 	if rollout == nil {
 		return
 	}
 	rolloutCopy := *rollout
 
 	dh.mu.Lock()
-	dh.lastRolloutState = &rolloutCopy
+	dh.lastRolloutState[service] = &rolloutCopy
 	dh.mu.Unlock()
 }
 
-// RecordActiveGenState stores the last active generation state for debugging
-func (dh *DebugHandler) RecordActiveGenState(activeGen *state.ActiveGenerationState) {
+// RecordActiveGenState stores the last active generation state for
+// debugging, keyed by the service the recovery pass ran for.
+func (dh *DebugHandler) RecordActiveGenState(service string, activeGen *state.ActiveGenerationState) {
 	if activeGen == nil {
 		return
 	}
 	activeGenCopy := *activeGen
 
 	dh.mu.Lock()
-	dh.lastActiveGenState = &activeGenCopy
+	dh.lastActiveGenState[service] = &activeGenCopy
 	dh.mu.Unlock()
 }
 
-// recoveryPlan returns the last recorded recovery plan, if any.
-func (dh *DebugHandler) recoveryPlan() *state.RecoveryPlan {
+// recoveryPlan returns the last recorded recovery plan for service, if any.
+func (dh *DebugHandler) recoveryPlan(service string) *state.RecoveryPlan {
 	dh.mu.RLock()
 	defer dh.mu.RUnlock()
-	return dh.lastRecoveryPlan
+	return dh.lastRecoveryPlan[service]
 }
 
-// rolloutState returns the last recorded rollout state, if any.
-func (dh *DebugHandler) rolloutState() *state.RolloutState {
+// rolloutState returns the last recorded rollout state for service, if any.
+func (dh *DebugHandler) rolloutState(service string) *state.RolloutState {
 	dh.mu.RLock()
 	defer dh.mu.RUnlock()
-	return dh.lastRolloutState
+	return dh.lastRolloutState[service]
 }
 
-// activeGenState returns the last recorded active generation state, if any.
-func (dh *DebugHandler) activeGenState() *state.ActiveGenerationState {
+// activeGenState returns the last recorded active generation state for
+// service, if any.
+func (dh *DebugHandler) activeGenState(service string) *state.ActiveGenerationState {
 	dh.mu.RLock()
 	defer dh.mu.RUnlock()
-	return dh.lastActiveGenState
+	return dh.lastActiveGenState[service]
 }
 
-// DebugRecoveryPlan returns the last recovery plan
-func (dh *DebugHandler) DebugRecoveryPlan(w io.Writer) error {
-	plan := dh.recoveryPlan()
+// DebugRecoveryPlan returns the last recovery plan for service
+func (dh *DebugHandler) DebugRecoveryPlan(w io.Writer, service string) error {
+	plan := dh.recoveryPlan(service)
 	if plan == nil {
 		return fmt.Errorf("no recovery plan recorded yet")
 	}
@@ -133,8 +147,8 @@ func (dh *DebugHandler) DebugAuthority(w io.Writer) error {
 	return json.NewEncoder(w).Encode(response)
 }
 
-// DebugGenerations returns current generation information
-func (dh *DebugHandler) DebugGenerations(w io.Writer) error {
+// DebugGenerations returns current generation information for service
+func (dh *DebugHandler) DebugGenerations(w io.Writer, service string) error {
 	snapshot := dh.metricsCollector.GetSnapshot()
 
 	response := map[string]interface{}{
@@ -144,15 +158,15 @@ func (dh *DebugHandler) DebugGenerations(w io.Writer) error {
 		"authority_transitions": snapshot.AuthorityTransitions,
 	}
 
-	if plan := dh.recoveryPlan(); plan != nil {
+	if plan := dh.recoveryPlan(service); plan != nil {
 		response["orphaned_generations"] = plan.OrphanedGenerationsFound
 	}
 
 	return json.NewEncoder(w).Encode(response)
 }
 
-// DebugRolloutState returns current rollout information
-func (dh *DebugHandler) DebugRolloutState(w io.Writer) error {
+// DebugRolloutState returns current rollout information for service
+func (dh *DebugHandler) DebugRolloutState(w io.Writer, service string) error {
 	response := map[string]interface{}{
 		"timestamp": time.Now().UTC(),
 	}
@@ -161,7 +175,7 @@ func (dh *DebugHandler) DebugRolloutState(w io.Writer) error {
 	response["current_phase"] = snapshot.CurrentRolloutPhase
 	response["stale_count"] = snapshot.TransitionStaleCount
 
-	if rollout := dh.rolloutState(); rollout != nil {
+	if rollout := dh.rolloutState(service); rollout != nil {
 		response["rollout_state"] = rollout
 	}
 
@@ -225,9 +239,9 @@ func (dh *DebugHandler) DebugMetrics(w io.Writer) error {
 	return json.NewEncoder(w).Encode(response)
 }
 
-// DebugDecisionTrace returns the decision trace from last recovery plan
-func (dh *DebugHandler) DebugDecisionTrace(w io.Writer) error {
-	plan := dh.recoveryPlan()
+// DebugDecisionTrace returns the decision trace from service's last recovery plan
+func (dh *DebugHandler) DebugDecisionTrace(w io.Writer, service string) error {
+	plan := dh.recoveryPlan(service)
 	if plan == nil {
 		return fmt.Errorf("no recovery plan recorded yet")
 	}
@@ -245,8 +259,8 @@ func (dh *DebugHandler) DebugDecisionTrace(w io.Writer) error {
 	return json.NewEncoder(w).Encode(response)
 }
 
-// DebugFullStatus returns comprehensive status
-func (dh *DebugHandler) DebugFullStatus(w io.Writer) error {
+// DebugFullStatus returns comprehensive status for service
+func (dh *DebugHandler) DebugFullStatus(w io.Writer, service string) error {
 	snapshot := dh.metricsCollector.GetSnapshot()
 
 	status := map[string]interface{}{
@@ -279,7 +293,7 @@ func (dh *DebugHandler) DebugFullStatus(w io.Writer) error {
 		},
 	}
 
-	if plan := dh.recoveryPlan(); plan != nil {
+	if plan := dh.recoveryPlan(service); plan != nil {
 		status["last_recovery_plan"] = map[string]interface{}{
 			"epoch":   plan.Epoch,
 			"action":  plan.Action,

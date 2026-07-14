@@ -671,15 +671,15 @@ func methodNotAllowed(w http.ResponseWriter, got, allowed string) {
 		"method_not_allowed")
 }
 
-// clientIP extracts client IP from request.
+// clientIP extracts the client IP from request.RemoteAddr. Deliberately
+// ignores X-Forwarded-For: the control API has no reverse proxy in front of
+// it (see package doc — reachable only from within the docker_rollout_mesh
+// bridge network), so every caller is a direct, untrusted peer. Honoring a
+// client-supplied XFF would let any caller forge a fresh IP per request and
+// bypass RateLimiter's per-IP cap entirely.
 func clientIP(r *http.Request) string {
-	// Check X-Forwarded-For (from proxy).
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		ips := strings.Split(xff, ",")
-		return strings.TrimSpace(ips[0])
-	}
-	// Fall back to RemoteAddr. Use SplitHostPort so IPv6 addresses
-	// (e.g. "[::1]:54321") yield the real host, not a bare "[".
+	// Use SplitHostPort so IPv6 addresses (e.g. "[::1]:54321") yield the
+	// real host, not a bare "[".
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return host
 	}

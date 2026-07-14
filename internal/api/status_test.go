@@ -132,8 +132,8 @@ func TestBuildStatusReportUsesDebugHandlerGenerationState(t *testing.T) {
 	mc := metrics.NewMetricsCollector()
 	dh := NewDebugHandler(nil, mc)
 
-	dh.RecordActiveGenState(&state.ActiveGenerationState{ActiveGeneration: "web-3"})
-	dh.RecordRolloutState(&state.RolloutState{OldGeneration: "web-2", NewGeneration: "web-3", Phase: state.RolloutDraining})
+	dh.RecordActiveGenState("web", &state.ActiveGenerationState{ActiveGeneration: "web-3"})
+	dh.RecordRolloutState("web", &state.RolloutState{OldGeneration: "web-2", NewGeneration: "web-3", Phase: state.RolloutDraining})
 
 	report := BuildStatusReport(context.Background(), "web", "1.0", proxy.StartupReady, reg, dh)
 
@@ -145,6 +145,44 @@ func TestBuildStatusReportUsesDebugHandlerGenerationState(t *testing.T) {
 	}
 	if report.DeploymentState != "draining" {
 		t.Errorf("DeploymentState = %q, want draining", report.DeploymentState)
+	}
+}
+
+// TestBuildStatusReportGenerationStateIsPerService reproduces the shared-proxy
+// bug where a DebugHandler with unkeyed lastActiveGenState/lastRolloutState
+// fields let one service's recovery pass overwrite what another service's
+// GET /status reported. executeRecoveryForProject runs recovery for every
+// configured service against the same DebugHandler, so recording "frontend"
+// after "api" must not change what BuildStatusReport("api", ...) sees.
+func TestBuildStatusReportGenerationStateIsPerService(t *testing.T) {
+	reg := proxy.NewRegistry()
+	mc := metrics.NewMetricsCollector()
+	dh := NewDebugHandler(nil, mc)
+
+	dh.RecordActiveGenState("api", &state.ActiveGenerationState{ActiveGeneration: "api-1"})
+	dh.RecordRolloutState("api", &state.RolloutState{OldGeneration: "api-0", NewGeneration: "api-1", Phase: state.RolloutCommitting})
+
+	// A later recovery pass for a different service on the same shared proxy.
+	dh.RecordActiveGenState("frontend", &state.ActiveGenerationState{ActiveGeneration: "frontend-7"})
+	dh.RecordRolloutState("frontend", &state.RolloutState{OldGeneration: "frontend-6", NewGeneration: "frontend-7", Phase: state.RolloutDraining})
+
+	apiReport := BuildStatusReport(context.Background(), "api", "1.0", proxy.StartupReady, reg, dh)
+	if apiReport.CurrentGeneration != "api-1" {
+		t.Errorf("api CurrentGeneration = %q, want api-1 (got frontend's state — cross-service leak)", apiReport.CurrentGeneration)
+	}
+	if apiReport.PreviousGeneration != "api-0" {
+		t.Errorf("api PreviousGeneration = %q, want api-0", apiReport.PreviousGeneration)
+	}
+	if apiReport.DeploymentState != string(state.RolloutCommitting) {
+		t.Errorf("api DeploymentState = %q, want %q", apiReport.DeploymentState, state.RolloutCommitting)
+	}
+
+	frontendReport := BuildStatusReport(context.Background(), "frontend", "1.0", proxy.StartupReady, reg, dh)
+	if frontendReport.CurrentGeneration != "frontend-7" {
+		t.Errorf("frontend CurrentGeneration = %q, want frontend-7", frontendReport.CurrentGeneration)
+	}
+	if frontendReport.PreviousGeneration != "frontend-6" {
+		t.Errorf("frontend PreviousGeneration = %q, want frontend-6", frontendReport.PreviousGeneration)
 	}
 }
 

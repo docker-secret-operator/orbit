@@ -45,12 +45,12 @@ Example:
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p := output.New(cmd.OutOrStdout(), jsonOut)
-			return runRollback(cmd, p, args[0], controlAddr, apiToken, to, drain, dryRun, yes, log)
+			return runRollback(cmd, p, args[0], controlAddr, resolveAPIToken(apiToken), to, drain, dryRun, yes, log)
 		},
 	}
 
 	cmd.Flags().StringVar(&controlAddr, "control-addr", "", "Override proxy control API address from state")
-	cmd.Flags().StringVar(&apiToken, "api-token", os.Getenv("ORBIT_API_TOKEN"), "Control API bearer token")
+	cmd.Flags().StringVar(&apiToken, "api-token", "", "Control API bearer token (falls back to ORBIT_API_TOKEN)")
 	cmd.Flags().DurationVarP(&drain, "drain", "d", 0, "Override drain period from state")
 	cmd.Flags().StringVar(&to, "to", "", "Roll back to a specific generation/backend ID (see limitations in --help)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show the rollback plan without executing it")

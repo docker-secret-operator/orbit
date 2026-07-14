@@ -221,6 +221,20 @@ func writeServicesConfig(path string, binds []compose.PortBinding) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+// resolveAPIToken returns flagValue if the operator passed --api-token
+// explicitly, otherwise falls back to ORBIT_API_TOKEN. The --api-token flag
+// itself must default to "" (never os.Getenv directly) — pflag prints a
+// flag's default verbatim in --help text, so wiring the env var straight
+// into the flag default would print the live secret to anyone who runs
+// --help with the token exported, and into docs/cli-reference/*.md via
+// `docker orbit docs`.
+func resolveAPIToken(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	return os.Getenv("ORBIT_API_TOKEN")
+}
+
 // ── rollout ───────────────────────────────────────────────────────────────────
 
 func rolloutCmd(log *zap.Logger) *cobra.Command {
@@ -256,6 +270,7 @@ Example:
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.Service = args[0]
+			opts.APIToken = resolveAPIToken(opts.APIToken)
 
 			// Acquire lock (with optional force).
 			var lock *rollout.FileLock
@@ -297,7 +312,7 @@ Example:
 	cmd.Flags().DurationVarP(&opts.Drain, "drain", "d", 5*time.Second, "Drain period before removing old container")
 	cmd.Flags().DurationVar(&opts.StabilityWindow, "stability", 10*time.Second, "How long to watch the new backend before draining the old one; auto-rolls back if it fails")
 	cmd.Flags().StringVar(&opts.ControlAddr, "control-addr", "http://localhost:9900", "Proxy control API address")
-	cmd.Flags().StringVar(&opts.APIToken, "api-token", os.Getenv("ORBIT_API_TOKEN"), "Control API bearer token")
+	cmd.Flags().StringVar(&opts.APIToken, "api-token", "", "Control API bearer token (falls back to ORBIT_API_TOKEN)")
 	cmd.Flags().BoolVar(&forceUnlock, "force-unlock", false, "Force unlock if previous process died (ONLY use after verifying process is gone)")
 	return cmd
 }
@@ -526,17 +541,21 @@ func runProxy(log *zap.Logger, version string) error {
 	// touch Docker lifecycle — so a service that never got past initial
 	// recovery (slower than the startup budget) or one whose only backend
 	// later crashes has nothing left to bring it back except a manual
-	// `docker orbit recover`. Reuses the same executeRecovery pass this
-	// file's SetRecoveryTrigger already calls on demand, on a slower ticker,
-	// only when the registry is actually empty of active backends.
+	// `docker orbit recover`. Goes through controlSrv.TriggerRecovery — the
+	// same recoveryMu/recoveryInFlight-guarded path POST /recover uses —
+	// rather than calling executeRecoveryForProject directly: this ticker
+	// and a concurrent POST /recover must never both run a recovery pass at
+	// once (each would independently write persisted state, last-write-wins,
+	// and double-count metrics). TriggerRecovery already calls
+	// controlSrv.SetStartupState internally (see the SetRecoveryTrigger
+	// closure above), so this loop doesn't need to.
 	//
 	// Scope (ADR-0006 Stage 3.5): the emptiness gate below (reg.Active())
-	// and the result extraction (results[cfg.ProxyInstance]) only cover
-	// cfg.ProxyInstance's own service, not every service wireProjectRegistry
-	// may have registered into pr. Intentional for this stage — Stage 3.5
-	// is configuration-only and does not extend runtime orchestration.
-	// Stage 4 is where this gate and extraction are expected to generalize
-	// to iterate every service in pr.Services(), the same pattern
+	// only covers cfg.ProxyInstance's own service, not every service
+	// wireProjectRegistry may have registered into pr. Intentional for this
+	// stage — Stage 3.5 is configuration-only and does not extend runtime
+	// orchestration. Stage 4 is where this gate is expected to generalize to
+	// iterate every service in pr.Services(), the same pattern
 	// executeRecoveryForProject and ProjectHealthController already use.
 	go func() {
 		t := time.NewTicker(5 * time.Second)
@@ -550,13 +569,13 @@ func runProxy(log *zap.Logger, version string) error {
 					continue
 				}
 				log.Info("runtime: zero active backends, attempting rediscovery")
-				results := executeRecoveryForProject(ctx, cfg, sm, pr, mc, debugHandler, log)
-				result := results[cfg.ProxyInstance]
-				if result.Err != nil {
-					log.Warn("runtime: rediscovery attempt failed", zap.Error(result.Err))
-					continue
+				if _, err := controlSrv.TriggerRecovery(ctx); err != nil {
+					if errors.Is(err, api.ErrRecoveryInFlight) {
+						log.Info("runtime: rediscovery skipped — a recovery pass is already in progress")
+					} else {
+						log.Warn("runtime: rediscovery attempt failed", zap.Error(err))
+					}
 				}
-				controlSrv.SetStartupState(result.State)
 			}
 		}
 	}()
@@ -675,6 +694,41 @@ func wireProjectRegistry(
 // err is reserved for future use — every failure mode today is absorbed into
 // a degraded/failed StartupState rather than a hard error, matching the
 // pre-existing startup behavior this replaces.
+// forceDegradedOnStateCorruption overrides plan to a safe Degraded outcome
+// when either persisted-state load failed with genuine on-disk corruption
+// (a *state.StateLoadError, distinct from the ordinary nil/nil "no state
+// file yet" case) — see the go-live audit's finding H5. Without this,
+// GenerateRecoveryPlan received a nil activeGenState/rolloutState
+// indistinguishable from a fresh install and would happily infer authority
+// from live health, discarding whatever the corrupted file actually
+// recorded (e.g. which generation was authoritative mid-rollout) in favor
+// of a different, possibly wrong, generation. No-op when plan is nil or
+// neither error is a StateLoadError.
+func forceDegradedOnStateCorruption(plan *state.RecoveryPlan, activeGenLoadErr, rolloutLoadErr error) *state.RecoveryPlan {
+	if plan == nil {
+		return plan
+	}
+
+	var reasons []string
+	if sle, ok := activeGenLoadErr.(*state.StateLoadError); ok && sle.IsFatal {
+		reasons = append(reasons, fmt.Sprintf("active generation state corrupted: %s", sle.Reason))
+	}
+	if sle, ok := rolloutLoadErr.(*state.StateLoadError); ok && sle.IsFatal {
+		reasons = append(reasons, fmt.Sprintf("rollout state corrupted: %s", sle.Reason))
+	}
+	if len(reasons) == 0 {
+		return plan
+	}
+
+	reason := "refusing to infer authority after state corruption (never guess): " + strings.Join(reasons, "; ")
+	plan.Action = state.RecoveryDegraded
+	plan.AuthoritativeGeneration = ""
+	plan.BackendsToRestore = nil
+	plan.FailedReason = reason
+	plan.Reason = reason
+	return plan
+}
+
 func executeRecovery(
 	ctx context.Context,
 	cfg *config.ProxyConfig,
@@ -696,18 +750,18 @@ func executeRecovery(
 	// return (nil, nil) when no state file exists yet — a non-nil error here
 	// means real corruption or an I/O failure, which must not be silently
 	// treated the same as "no prior state".
-	activeGenState, err := sm.LoadActiveGenerationState(service)
-	if err != nil {
+	activeGenState, activeGenLoadErr := sm.LoadActiveGenerationState(service)
+	if activeGenLoadErr != nil {
 		log.Error("recovery: active generation state unreadable, proceeding as if absent",
-			zap.Error(err))
+			zap.Error(activeGenLoadErr))
 	}
-	rolloutState, err := sm.LoadRolloutState(service)
-	if err != nil {
+	rolloutState, rolloutLoadErr := sm.LoadRolloutState(service)
+	if rolloutLoadErr != nil {
 		log.Error("recovery: rollout state unreadable, proceeding as if absent",
-			zap.Error(err))
+			zap.Error(rolloutLoadErr))
 	}
-	debugHandler.RecordActiveGenState(activeGenState)
-	debugHandler.RecordRolloutState(rolloutState)
+	debugHandler.RecordActiveGenState(service, activeGenState)
+	debugHandler.RecordRolloutState(service, rolloutState)
 
 	// Discover backends and build inventory snapshot. One retry budget
 	// (bounded to cfg.StartupTimeout, not the caller's ctx — the on-demand
@@ -719,7 +773,7 @@ func executeRecovery(
 	defer retryCancel()
 
 	var source *proxy.DockerRecoverySource
-	source, err = proxy.NewDockerRecoverySourceWithConfig(service, log, cfg.TCPDialTimeout, 10)
+	source, err := proxy.NewDockerRecoverySourceWithConfig(service, log, cfg.TCPDialTimeout, 10)
 	for err != nil && retryCtx.Err() == nil {
 		log.Warn("recovery: docker daemon unreachable, retrying within startup budget",
 			zap.Error(err))
@@ -827,7 +881,8 @@ func executeRecovery(
 
 	// Generate deterministic recovery plan.
 	plan = state.GenerateRecoveryPlan(sm, service, rolloutState, activeGenState, inventory, backendSnapshots, cfg.TransitionTimeout, log)
-	debugHandler.RecordRecoveryPlan(plan)
+	plan = forceDegradedOnStateCorruption(plan, activeGenLoadErr, rolloutLoadErr)
+	debugHandler.RecordRecoveryPlan(service, plan)
 
 	// Execute recovery plan: register backends according to traffic roles.
 	if plan != nil {
@@ -1270,13 +1325,30 @@ func buildGenerationInventory(
 			gen = service + "-default"
 		}
 
+		// Real Docker container creation time when known (see
+		// RecoveryResult.BackendCreatedAt) — falls back to now only when
+		// unavailable. Using the same now for every generation made
+		// recovery's "longest healthy uptime" tie-break unable to
+		// distinguish generations, falling through to Go's randomized map
+		// iteration order whenever 2+ were simultaneously healthy.
+		created := now
+		if t, ok := result.BackendCreatedAt[backend.ID]; ok && !t.IsZero() {
+			created = t
+		}
+
 		// Get or create generation metrics.
 		if _, exists := generationMap[gen]; !exists {
 			generationMap[gen] = &state.GenerationMetrics{
 				Generation:             gen,
-				CreatedAt:              now, // Approximate creation time
-				ContinuousHealthyStart: now,
+				CreatedAt:              created,
+				ContinuousHealthyStart: created,
 			}
+		} else if created.Before(generationMap[gen].CreatedAt) {
+			// Oldest backend's creation time represents the generation —
+			// mirrors DeriveHealthStreakStartTime's "all healthy: use
+			// oldest container creation" rule, applied per generation.
+			generationMap[gen].CreatedAt = created
+			generationMap[gen].ContinuousHealthyStart = created
 		}
 
 		m := generationMap[gen]

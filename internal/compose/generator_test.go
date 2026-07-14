@@ -185,6 +185,68 @@ func TestGenerate_BackingServiceLabels(t *testing.T) {
 	}
 }
 
+// TestGenerate_BackingServiceLabels_ListFormInput reproduces the go-live
+// audit's finding H2: Docker Compose allows `labels:` as either a map or a
+// list (`- "KEY=value"`) — list form is at least as common as map form in
+// real compose files. The label-merge step only handled the map case, so a
+// service with list-form labels silently lost its orbit.io/* ownership
+// labels: no error, but internal/proxy/recovery.go's extractBackend then
+// treats the container as having "incomplete ownership labels" and never
+// registers it — the proxy comes up with zero backends for that service.
+func TestGenerate_BackingServiceLabels_ListFormInput(t *testing.T) {
+	y := `
+version: "3.9"
+services:
+  api:
+    image: myapp:latest
+    ports:
+      - "3000:3000"
+    labels:
+      - "com.example.foo=bar"
+`
+	cf := parse(t, y)
+	out, _, err := compose.Generate(cf)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	api := out.Services["api"]
+	labels, ok := api.RawFields["labels"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("backing service should have map-form labels in RawFields after generate, got %T: %v", api.RawFields["labels"], api.RawFields["labels"])
+	}
+	if labels["orbit.io/managed"] != "true" {
+		t.Errorf("orbit.io/managed = %v, want true — list-form input labels must not suppress ownership label injection", labels["orbit.io/managed"])
+	}
+	if labels["com.example.foo"] != "bar" {
+		t.Errorf("original list-form label com.example.foo=bar was dropped, got %v", labels)
+	}
+}
+
+// TestGenerate_CollidingProxyName_Errors closes the go-live audit's finding
+// M2: Generate unconditionally assigns
+// out.Services["docker-rollout-proxy-"+name], silently overwriting a real
+// user-defined service of that exact name (the most realistic trigger:
+// accidentally re-running `generate` against a file that is itself already
+// Orbit-generated). It must fail closed with an error instead of discarding
+// the user's service definition.
+func TestGenerate_CollidingProxyName_Errors(t *testing.T) {
+	y := `
+version: "3.9"
+services:
+  api:
+    image: myapp:latest
+    ports:
+      - "3000:3000"
+  docker-rollout-proxy-api:
+    image: something-unrelated:latest
+`
+	cf := parse(t, y)
+	_, _, err := compose.Generate(cf)
+	if err == nil {
+		t.Fatal("Generate should error when the input already defines a service named docker-rollout-proxy-api")
+	}
+}
+
 func TestGenerate_MultiPort(t *testing.T) {
 	y := `
 version: "3.9"

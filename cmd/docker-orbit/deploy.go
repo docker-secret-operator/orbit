@@ -56,6 +56,7 @@ Example:
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.Service = args[0]
+			opts.APIToken = resolveAPIToken(opts.APIToken)
 			p := output.New(cmd.OutOrStdout(), jsonOut)
 			return runDeploy(cmd, p, opts, project, dryRun, yes, forceUnlock, log)
 		},
@@ -68,7 +69,7 @@ Example:
 	cmd.Flags().DurationVarP(&opts.Drain, "drain", "d", 5*time.Second, "Drain period before removing old container")
 	cmd.Flags().DurationVar(&opts.StabilityWindow, "stability", 10*time.Second, "How long to watch the new backend before draining the old one; auto-rolls back if it fails")
 	cmd.Flags().StringVar(&opts.ControlAddr, "control-addr", "http://localhost:9900", "Proxy control API address")
-	cmd.Flags().StringVar(&opts.APIToken, "api-token", os.Getenv("ORBIT_API_TOKEN"), "Control API bearer token")
+	cmd.Flags().StringVar(&opts.APIToken, "api-token", "", "Control API bearer token (falls back to ORBIT_API_TOKEN)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show the deployment plan without executing it")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip the confirmation prompt (required for non-interactive/CI use)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output as JSON")

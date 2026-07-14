@@ -223,6 +223,51 @@ func TestRecoveryNeverProducesRestoreWithoutHealthyBackend(t *testing.T) {
 	}
 }
 
+// ── Scenario 5: crash mid-transition before the new generation is healthy ────
+// A deploy crashed right after /authority/transitioning was recorded, before
+// the new generation passed its stability check — the new generation has zero
+// healthy backends, but the old generation (now marked draining) is still
+// fully healthy and was serving traffic the whole time. Recovery must still
+// produce at least one registrable (CandidateValid) backend — the healthy old
+// generation — so the proxy doesn't come up with zero backends and drop all
+// traffic despite a perfectly healthy generation sitting right there.
+func TestRecoveryScenario_InterruptedTransitionNewGenUnhealthy_OldGenStillRegistrable(t *testing.T) {
+	now := time.Now()
+	rollout := &RolloutState{
+		Service:            "web",
+		OldGeneration:      "gen-old",
+		NewGeneration:      "gen-new",
+		Authority:          AuthorityTransitioning,
+		Phase:              RolloutDraining,
+		TransitionStart:    now.Add(-10 * time.Second),
+		LastProgressAt:     now.Add(-2 * time.Second),
+		TransitionDeadline: now.Add(5 * time.Minute),
+	}
+	inv := &GenerationInventory{GenerationStates: map[string]GenerationMetrics{
+		"gen-old": {Generation: "gen-old", HealthyCount: 1, TotalCount: 1, CreatedAt: now.Add(-1 * time.Hour)},
+		"gen-new": {Generation: "gen-new", HealthyCount: 0, TotalCount: 1, CreatedAt: now.Add(-5 * time.Second)},
+	}}
+	backends := []BackendSnapshot{
+		{Generation: "gen-old", ID: "old-1", Addr: "10.0.0.1:80", Health: "healthy"},
+		{Generation: "gen-new", ID: "new-1", Addr: "10.0.0.2:80", Health: "unhealthy"},
+	}
+
+	plan := planFor(t, "web", rollout, nil, inv, backends)
+
+	validCount := 0
+	for _, c := range plan.BackendsToRestore {
+		if c.ValidityStatus == CandidateValid {
+			validCount++
+			if c.Generation != "gen-old" {
+				t.Errorf("valid candidate should be the healthy old generation, got %q", c.Generation)
+			}
+		}
+	}
+	if validCount == 0 {
+		t.Fatalf("interrupted transition with a healthy draining generation must produce at least one CandidateValid backend to register — got zero valid candidates in %+v (this is the zero-backend-outage bug: registration in cmd/docker-orbit/main.go skips any candidate whose ValidityStatus != CandidateValid)", plan.BackendsToRestore)
+	}
+}
+
 // assertDeterministic runs gen n times and fails if any run's decision differs
 // from the first — the "deterministic behavior across repeated deployments"
 // success criterion, exercised directly.

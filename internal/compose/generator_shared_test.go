@@ -29,6 +29,31 @@ services:
 
 // ── Shared-proxy topology ───────────────────────────────────────────────────
 
+// TestGenerateShared_CollidingProxyName_Errors closes the go-live audit's
+// finding M2: GenerateShared unconditionally assigns
+// out.Services["docker-rollout-proxy"], silently overwriting a real
+// user-defined service of that exact name (the most realistic trigger:
+// accidentally re-running `generate --shared-proxy` against a file that is
+// itself already Orbit-generated). It must fail closed with an error
+// instead of discarding the user's service definition.
+func TestGenerateShared_CollidingProxyName_Errors(t *testing.T) {
+	y := `
+version: "3.9"
+services:
+  web:
+    image: myapp/web:latest
+    ports:
+      - "3000:3000"
+  docker-rollout-proxy:
+    image: something-unrelated:latest
+`
+	cf := parse(t, y)
+	_, _, err := compose.GenerateShared(cf)
+	if err == nil {
+		t.Fatal("GenerateShared should error when the input already defines a service named docker-rollout-proxy")
+	}
+}
+
 func TestGenerateShared_OneProxyServiceForAllEligible(t *testing.T) {
 	cf := parse(t, sharedGeneratorInput)
 	out, sum, err := compose.GenerateShared(cf)

@@ -51,6 +51,21 @@ type RecoveryResult struct {
 	ExpectedServices int             // Expected service/backend count (0 = not tracked)
 	RecoveredAt      time.Time       // When recovery completed
 	DurationMs       int64           // Total recovery duration milliseconds
+
+	// BackendCreatedAt maps backend ID (ORBIT_BACKEND_ID, not Docker
+	// container ID) to that container's real Docker creation time. Kept
+	// separate from BackendHealth (rather than adding a field there) so the
+	// health-check hot path in health.go doesn't need to thread it through
+	// every BackendHealth construction site — only DiscoverAndValidateBackends
+	// populates it, from data it already has via containerMap. Consumed by
+	// cmd/docker-orbit's buildGenerationInventory to derive real per-generation
+	// CreatedAt/ContinuousHealthyStart timestamps instead of stamping every
+	// generation with the same process-local time.Now(), which made
+	// generation tie-breaking during recovery fall through to Go's
+	// randomized map iteration order whenever 2+ generations were
+	// simultaneously healthy. Absent entries (id not found) mean the caller
+	// should fall back to its own conservative default.
+	BackendCreatedAt map[string]time.Time
 }
 
 // TimeoutConfig holds timeout configuration for recovery operations.

@@ -85,12 +85,18 @@ func Generate(input *ComposeFile) (*ComposeFile, *Summary, error) {
 
 		default:
 			// Inject proxy.
+			proxyName := "docker-rollout-proxy-" + name
+			if _, collides := input.Services[proxyName]; collides {
+				return nil, nil, fmt.Errorf(
+					"generator: service %q needs a proxy named %q, but the input already defines a service with that exact name (likely re-running generate on an already-generated file) — rename or remove it first",
+					name, proxyName)
+			}
 			backing, pairs, err := buildBackingService(name, svc)
 			if err != nil {
 				return nil, nil, fmt.Errorf("generator: service %q: %w", name, err)
 			}
 			out.Services[name] = backing
-			out.Services["docker-rollout-proxy-"+name] = buildLegacyProxyService(name, pairs)
+			out.Services[proxyName] = buildLegacyProxyService(name, pairs)
 			sum.Proxied = append(sum.Proxied, name)
 
 			// Named volume for the proxy's ORBIT_STATE_DIR (/var/lib/orbit) —
@@ -172,6 +178,12 @@ func GenerateShared(input *ComposeFile) (*ComposeFile, *Summary, error) {
 	}
 
 	if len(entries) > 0 {
+		if _, collides := input.Services["docker-rollout-proxy"]; collides {
+			return nil, nil, fmt.Errorf(
+				"generator: shared proxy needs the name %q, but the input already defines a service with that exact name (likely re-running generate --shared-proxy on an already-generated file) — rename or remove it first",
+				"docker-rollout-proxy")
+		}
+
 		// Deterministic regardless of Go's randomized map iteration order —
 		// the "default" service (ORBIT_PROXY_INSTANCE / ORBIT_BINDS, used
 		// for unscoped control-API requests until Control API service
@@ -291,17 +303,44 @@ func buildBackingService(name string, svc Service) (backing Service, pairs []por
 		"orbit.io/generation":     name + "-default",
 		"orbit.io/proxy-instance": name,
 	}
-	if existing, ok := backing.RawFields["labels"]; ok {
-		if m, ok := existing.(map[string]interface{}); ok {
-			for k, v := range labels {
-				m[k] = v
-			}
-		}
-	} else {
-		backing.RawFields["labels"] = labels
+	merged := normalizeLabelsToMap(backing.RawFields["labels"])
+	for k, v := range labels {
+		merged[k] = v
 	}
+	backing.RawFields["labels"] = merged
 
 	return backing, pairs, nil
+}
+
+// normalizeLabelsToMap converts a Compose `labels:` stanza — which YAML
+// allows as either map form (`KEY: value`) or list form (`- "KEY=value"`,
+// at least as common in real compose files) — into a single
+// map[string]interface{}, so ownership-label injection always has something
+// it can merge into regardless of which form the input used. A list entry
+// with no "=" is treated as a label with an empty value, matching Docker
+// Compose's own handling.
+func normalizeLabelsToMap(raw interface{}) map[string]interface{} {
+	switch v := raw.(type) {
+	case map[string]interface{}:
+		return v
+	case []interface{}:
+		out := make(map[string]interface{}, len(v))
+		for _, entry := range v {
+			s, ok := entry.(string)
+			if !ok {
+				continue
+			}
+			k, val, found := strings.Cut(s, "=")
+			if !found {
+				out[k] = ""
+				continue
+			}
+			out[k] = val
+		}
+		return out
+	default:
+		return make(map[string]interface{})
+	}
 }
 
 // buildLegacyProxyService builds the docker-rollout-proxy-<service> stanza

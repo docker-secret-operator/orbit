@@ -141,6 +141,50 @@ func TestRecover_ConcurrentCallsAreSerialized(t *testing.T) {
 	}
 }
 
+// TestTriggerRecovery_ConcurrentCallsAreSerialized closes the go-live
+// audit's finding M1: cmd/docker-orbit's periodic rediscovery goroutine
+// used to call executeRecoveryForProject directly, bypassing the
+// recoveryMu/recoveryInFlight guard POST /recover relies on — so an
+// in-process caller (the ticker) and an HTTP POST /recover could run two
+// recovery passes concurrently, each independently writing
+// ActiveGenerationState/RolloutState (last-write-wins) and double-counting
+// metrics. TriggerRecovery is the same guarded path handleRecover uses,
+// exposed for in-process callers — two concurrent calls must never both
+// proceed.
+func TestTriggerRecovery_ConcurrentCallsAreSerialized(t *testing.T) {
+	cs, _ := newRecoveryTestAPI(t, "")
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cs.SetRecoveryTrigger(func(ctx context.Context) (rolloutapi.RecoveryOutcome, error) {
+		started <- struct{}{}
+		<-release
+		return rolloutapi.RecoveryOutcome{ProxyStatus: "ready"}, nil
+	})
+
+	type result struct {
+		outcome rolloutapi.RecoveryOutcome
+		err     error
+	}
+	firstCh := make(chan result, 1)
+	go func() {
+		outcome, err := cs.TriggerRecovery(context.Background())
+		firstCh <- result{outcome, err}
+	}()
+	<-started
+
+	_, err := cs.TriggerRecovery(context.Background())
+	if err == nil {
+		t.Fatal("second concurrent TriggerRecovery call should be rejected while the first is in flight")
+	}
+
+	close(release)
+	first := <-firstCh
+	if first.err != nil {
+		t.Errorf("first call should succeed, got error: %v", first.err)
+	}
+}
+
 func TestRecover_RequiresAuthWhenTokenSet(t *testing.T) {
 	cs, ts := newRecoveryTestAPI(t, "secret-token")
 	cs.SetRecoveryTrigger(func(ctx context.Context) (rolloutapi.RecoveryOutcome, error) {

@@ -7,6 +7,31 @@ import (
 	"time"
 )
 
+// TestValidateStateDir_CreatesWithRestrictivePermissions closes the go-live
+// audit's finding M4: validateStateDir created a missing state directory
+// 0755 (world-readable+executable), unlike internal/history's own state
+// directory (0700). State files inside are individually 0600 and carry
+// deployment topology/timing (and, per SECURITY.md, potentially the API
+// token), but a world-readable+executable directory still lets any local
+// user enumerate service names and deployment activity via directory
+// listing on a shared host.
+func TestValidateStateDir_CreatesWithRestrictivePermissions(t *testing.T) {
+	base := t.TempDir()
+	stateDir := base + "/orbit-state"
+
+	if err := validateStateDir(stateDir); err != nil {
+		t.Fatalf("validateStateDir: %v", err)
+	}
+
+	info, err := os.Stat(stateDir)
+	if err != nil {
+		t.Fatalf("stat created dir: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0700 {
+		t.Errorf("state dir permissions = %o, want 0700 (got world-readable/executable)", perm)
+	}
+}
+
 func TestLoadProxyConfigDefaults(t *testing.T) {
 	// Setup: clear env and set only required var
 	t.Helper()

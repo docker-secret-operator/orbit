@@ -2,10 +2,19 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
 )
+
+// ErrRecoveryNotWired is returned by TriggerRecovery when no RecoveryFunc
+// has been attached via SetRecoveryTrigger.
+var ErrRecoveryNotWired = errors.New("recovery trigger not wired")
+
+// ErrRecoveryInFlight is returned by TriggerRecovery when another recovery
+// pass is already running.
+var ErrRecoveryInFlight = errors.New("a recovery pass is already in progress")
 
 // RecoveryOutcome is the response body for POST /recover — the same
 // information state.GenerateRecoveryPlan already computes and the proxy
@@ -61,30 +70,28 @@ func (cs *ControlServer) SetRecoveryTrigger(fn RecoveryFunc) {
 	cs.recoveryFn = fn
 }
 
-// POST /recover — triggers a real, on-demand recovery pass. Serialized: a
-// recovery already in progress causes a concurrent request to receive 409
-// rather than running two passes that both mutate the backend registry at
-// once (state.GenerateRecoveryPlan's epoch counter alone doesn't prevent
-// that — the registry mutation does need this here).
-func (cs *ControlServer) handleRecover(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w, r.Method, "POST")
-		return
-	}
-
+// TriggerRecovery runs one serialized, on-demand recovery pass through the
+// exact same recoveryMu/recoveryInFlight guard POST /recover uses — the
+// choke point every caller of recovery must go through, in-process or over
+// HTTP, so no two passes ever run concurrently and both mutate the backend
+// registry at once (state.GenerateRecoveryPlan's epoch counter alone
+// doesn't prevent that — the registry mutation does need this here).
+//
+// In-process callers (e.g. cmd/docker-orbit's periodic rediscovery ticker)
+// must call this instead of invoking their own recovery pass directly —
+// doing so would bypass this guard and let a ticker-triggered pass race a
+// concurrent POST /recover, each independently writing persisted state
+// (last-write-wins) and double-counting metrics.
+func (cs *ControlServer) TriggerRecovery(ctx context.Context) (RecoveryOutcome, error) {
 	cs.recoveryMu.Lock()
 	fn := cs.recoveryFn
 	if fn == nil {
 		cs.recoveryMu.Unlock()
-		writeErr(w, http.StatusServiceUnavailable,
-			"recovery trigger not wired — this proxy build predates POST /recover, or SetRecoveryTrigger was never called",
-			"unavailable")
-		return
+		return RecoveryOutcome{}, ErrRecoveryNotWired
 	}
 	if cs.recoveryInFlight {
 		cs.recoveryMu.Unlock()
-		writeErr(w, http.StatusConflict, "a recovery pass is already in progress", "conflict")
-		return
+		return RecoveryOutcome{}, ErrRecoveryInFlight
 	}
 	cs.recoveryInFlight = true
 	cs.recoveryMu.Unlock()
@@ -95,9 +102,28 @@ func (cs *ControlServer) handleRecover(w http.ResponseWriter, r *http.Request) {
 		cs.recoveryMu.Unlock()
 	}()
 
-	outcome, err := fn(r.Context())
+	return fn(ctx)
+}
+
+// POST /recover — triggers a real, on-demand recovery pass via TriggerRecovery.
+func (cs *ControlServer) handleRecover(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, r.Method, "POST")
+		return
+	}
+
+	outcome, err := cs.TriggerRecovery(r.Context())
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "recovery failed: "+err.Error(), "internal_error")
+		switch {
+		case errors.Is(err, ErrRecoveryNotWired):
+			writeErr(w, http.StatusServiceUnavailable,
+				"recovery trigger not wired — this proxy build predates POST /recover, or SetRecoveryTrigger was never called",
+				"unavailable")
+		case errors.Is(err, ErrRecoveryInFlight):
+			writeErr(w, http.StatusConflict, "a recovery pass is already in progress", "conflict")
+		default:
+			writeErr(w, http.StatusInternalServerError, "recovery failed: "+err.Error(), "internal_error")
+		}
 		return
 	}
 	writeJSON(w, http.StatusOK, outcome)

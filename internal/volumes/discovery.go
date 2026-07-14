@@ -1,3 +1,15 @@
+// Package volumes implements snapshot/rollback safety for stateful services'
+// volumes during a deploy.
+//
+// NOT WIRED INTO internal/rollout AS OF 2026-07-14: Run/Rollback never call
+// VolumeManager or RolloutVolumeCoordinator. A rollout of a stateful service
+// today gets no read-only remount, no pre-rollout snapshot, and no
+// volume-state rollback from this package — that protection simply doesn't
+// execute yet. This was a deliberate scoping decision (see
+// docs/adr/GO-LIVE-SECURITY-AUDIT-2026-07-14.md, finding C3) to exclude
+// stateful-service volume protection from this release rather than rush
+// wiring it up under time pressure. See docs/governance/SECURITY.md for the
+// user-facing statement of this gap.
 package volumes
 
 import (
