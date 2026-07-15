@@ -38,7 +38,9 @@ jobs:
         run: make test
 
       - name: Lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
 
       - name: GoReleaser
         uses: goreleaser/goreleaser-action@v6
