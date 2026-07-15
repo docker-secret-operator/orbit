@@ -18,7 +18,11 @@ func (e explodingRuntime) Pull(context.Context, string, string) error {
 	e.t.Fatal("Pull should never be called for an invalid service name")
 	return nil
 }
-func (e explodingRuntime) ServiceReplicaCount(context.Context, string) (int, error) {
+func (e explodingRuntime) ResolveProject(context.Context, string) (string, error) {
+	e.t.Fatal("ResolveProject should never be called for an invalid service name")
+	return "", nil
+}
+func (e explodingRuntime) ServiceReplicaCount(context.Context, string, string) (int, error) {
 	e.t.Fatal("ServiceReplicaCount should never be called for an invalid service name")
 	return 0, nil
 }
@@ -26,11 +30,11 @@ func (e explodingRuntime) ScaleService(context.Context, string, string, int) err
 	e.t.Fatal("ScaleService should never be called for an invalid service name")
 	return nil
 }
-func (e explodingRuntime) WaitForNewContainer(context.Context, Options, *zap.Logger) (string, string, error) {
+func (e explodingRuntime) WaitForNewContainer(context.Context, string, Options, *zap.Logger) (string, string, error) {
 	e.t.Fatal("WaitForNewContainer should never be called for an invalid service name")
 	return "", "", nil
 }
-func (e explodingRuntime) FindOldContainer(context.Context, string, string) (string, error) {
+func (e explodingRuntime) FindOldContainer(context.Context, string, string, string) (string, error) {
 	e.t.Fatal("FindOldContainer should never be called for an invalid service name")
 	return "", nil
 }

@@ -95,7 +95,7 @@ func TestExecuteRecoveryForProject_SingleServiceResultExtraction(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	results := executeRecoveryForProject(ctx, cfg, sm, pr, mc, debugHandler, zap.NewNop())
+	results := executeRecoveryForProject(ctx, cfg, sm, pr, "test-project", mc, debugHandler, zap.NewNop())
 
 	result, ok := results["web"]
 	if !ok {

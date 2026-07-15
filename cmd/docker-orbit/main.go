@@ -34,6 +34,7 @@ import (
 	"github.com/docker-secret-operator/orbit/internal/proxy"
 	"github.com/docker-secret-operator/orbit/internal/rollout"
 	"github.com/docker-secret-operator/orbit/internal/state"
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
@@ -369,6 +370,66 @@ func proxyCmd(log *zap.Logger) *cobra.Command {
 	return cmd
 }
 
+// dockerInspector is the minimal Docker capability resolveOwnProjectIdentity
+// needs, narrowed from *client.Client so self-identity resolution can be
+// unit-tested against a fake — mirroring internal/proxy/docker_seam.go's
+// containerInspector seam for the identical reason. The real Docker client
+// satisfies this structurally with no adapter.
+type dockerInspector interface {
+	ContainerInspect(ctx context.Context, containerID string) (types.ContainerJSON, error)
+}
+
+var _ dockerInspector = (*client.Client)(nil)
+
+// resolveOwnProjectIdentity resolves the Compose project this proxy process
+// itself belongs to, per ADR-0007 §7/§9/§10: the proxy's own Docker-assigned
+// hostname (its own short container ID by default) is inspected directly,
+// and the resulting container's com.docker.compose.project label is read
+// off — never an environment variable, never persisted, never re-derived
+// after this call. A single attempt; callers requiring the bounded startup
+// retry budget (ADR-0007 §15) use resolveOwnProjectIdentityWithRetry.
+func resolveOwnProjectIdentity(ctx context.Context, cl dockerInspector) (string, error) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "", fmt.Errorf("resolve own project identity: hostname: %w", err)
+	}
+
+	inspect, err := cl.ContainerInspect(ctx, hostname)
+	if err != nil {
+		return "", fmt.Errorf("resolve own project identity: inspect %q: %w", hostname, err)
+	}
+
+	project := inspect.Config.Labels["com.docker.compose.project"]
+	if project == "" {
+		return "", fmt.Errorf("resolve own project identity: container %q has no com.docker.compose.project label", hostname)
+	}
+
+	return project, nil
+}
+
+// resolveOwnProjectIdentityWithRetry retries resolveOwnProjectIdentity within
+// ctx's deadline (the caller sets this to cfg.StartupTimeout, matching the
+// existing bounded-retry pattern executeRecovery already uses for Docker
+// daemon connectivity) — covering a transiently-restarting Docker daemon at
+// boot. Once ctx expires with no successful resolution, this returns an
+// error and the caller must fail startup entirely (ADR-0007 §15): there is
+// no silent "no project scope" fallback.
+func resolveOwnProjectIdentityWithRetry(ctx context.Context, cl dockerInspector, log *zap.Logger, retryInterval time.Duration) (string, error) {
+	project, err := resolveOwnProjectIdentity(ctx, cl)
+	for err != nil && ctx.Err() == nil {
+		log.Warn("proxy: could not resolve own project identity, retrying within startup budget", zap.Error(err))
+		select {
+		case <-time.After(retryInterval):
+		case <-ctx.Done():
+		}
+		project, err = resolveOwnProjectIdentity(ctx, cl)
+	}
+	if err != nil {
+		return "", fmt.Errorf("resolve own project identity: exhausted startup retry budget: %w", err)
+	}
+	return project, nil
+}
+
 func runProxy(log *zap.Logger, version string) error {
 	// Load configuration from environment.
 	cfg, err := config.LoadProxyConfig()
@@ -394,6 +455,32 @@ func runProxy(log *zap.Logger, version string) error {
 		fmt.Fprintf(os.Stderr, "ERROR: services config failed: %v\n", err)
 		return err
 	}
+
+	// ADR-0007 PR-A: resolve this proxy process's own Compose project via
+	// self-inspection (hostname -> ContainerInspect -> com.docker.compose.
+	// project) before any runtime component is constructed — a component
+	// cannot check "does this match my project" before the proxy can answer
+	// "what is my project" (ADR-0007 §24). The Docker client constructed
+	// here is reused below for the Reconciler, never a second client.
+	//
+	// Fail closed: if this proxy cannot determine its own project identity
+	// within the startup budget, startup does not proceed at all — there is
+	// no silent "no project scope" fallback (ADR-0007 §15).
+	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		log.Error("proxy: startup failed", zap.Error(err), zap.String("reason", "docker client unavailable"))
+		return fmt.Errorf("proxy: docker client: %w", err)
+	}
+	defer dockerClient.Close() //nolint:errcheck // deferred docker client close on shutdown; error not actionable
+
+	identCtx, identCancel := context.WithTimeout(context.Background(), cfg.StartupTimeout)
+	ownProject, err := resolveOwnProjectIdentityWithRetry(identCtx, dockerClient, log, time.Second)
+	identCancel()
+	if err != nil {
+		log.Error("proxy: startup failed", zap.Error(err), zap.String("reason", "could not resolve own project identity"))
+		return fmt.Errorf("proxy: resolve own project identity: %w", err)
+	}
+	log.Info("proxy: resolved own project identity", zap.String("project", ownProject))
 
 	srv := proxy.NewServer(log, m)
 	pr, reg, err := wireProjectRegistry(srv, m, cfg.ProxyInstance, servicesCfg, log)
@@ -440,7 +527,7 @@ func runProxy(log *zap.Logger, version string) error {
 		// shape — not a new aggregation policy. A true multi-service
 		// RecoveryOutcome shape is later work (this stage does not modify
 		// ControlServer or api.RecoveryOutcome).
-		results := executeRecoveryForProject(ctx, cfg, sm, pr, mc, debugHandler, log)
+		results := executeRecoveryForProject(ctx, cfg, sm, pr, ownProject, mc, debugHandler, log)
 		result := results[cfg.ProxyInstance]
 		if result.Err != nil {
 			return api.RecoveryOutcome{}, result.Err
@@ -451,7 +538,7 @@ func runProxy(log *zap.Logger, version string) error {
 	})
 
 	recoveryCtx, cancel := context.WithTimeout(context.Background(), cfg.StartupTimeout)
-	startupResults := executeRecoveryForProject(recoveryCtx, cfg, sm, pr, mc, debugHandler, log)
+	startupResults := executeRecoveryForProject(recoveryCtx, cfg, sm, pr, ownProject, mc, debugHandler, log)
 	startupState := startupResults[cfg.ProxyInstance].State
 	cancel()
 
@@ -525,28 +612,28 @@ func runProxy(log *zap.Logger, version string) error {
 	// second reconciliation trigger requires: one goroutine, one select
 	// loop, so ReconcileOnce can never run concurrently with itself.
 	//
-	// PR 4.4: eventSourceWG is waited on before reconcilerDocker.Close()
-	// fires (below, at shutdown) — es.Run stopping when ctx is cancelled
-	// is necessary but not sufficient, since "stops eventually" and
-	// "closing the client it's still using is now safe" are different
+	// PR 4.4: eventSourceWG is waited on before dockerClient.Close() fires
+	// (deferred above, at shutdown) — es.Run stopping when ctx is
+	// cancelled is necessary but not sufficient, since "stops eventually"
+	// and "closing the client it's still using is now safe" are different
 	// claims. Without this, Close() could run concurrently with es.Run
 	// still mid-ReconcileOnce, closing the Docker client out from under
 	// it.
+	//
+	// ADR-0007 PR-A: reuses dockerClient (constructed once, above, for
+	// self-inspection) rather than a second client — startup already
+	// failed closed if that construction failed, so this is no longer a
+	// best-effort branch. ownProject (also resolved above) is threaded
+	// into NewReconciler explicitly; Reconciler never re-derives it.
 	var eventSourceWG sync.WaitGroup
-	reconcilerDocker, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		log.Warn("runtime: reconciler NOT activated (docker client unavailable)", zap.Error(err))
-	} else {
-		defer reconcilerDocker.Close() //nolint:errcheck // deferred docker client close on shutdown; error not actionable
-		rc := proxy.NewReconciler(pr, reconcilerDocker, m, log)
-		es := proxy.NewEventSource(rc, reconcilerDocker, cfg.ReconcileInterval, m, log)
-		eventSourceWG.Add(1)
-		go func() {
-			defer eventSourceWG.Done()
-			es.Run(ctx) // stops when the shutdown signal cancels ctx
-		}()
-		log.Info("runtime: reconciler + event source activated", zap.Duration("periodic_interval", cfg.ReconcileInterval))
-	}
+	rc := proxy.NewReconciler(pr, dockerClient, ownProject, m, log)
+	es := proxy.NewEventSource(rc, dockerClient, cfg.ReconcileInterval, m, log)
+	eventSourceWG.Add(1)
+	go func() {
+		defer eventSourceWG.Done()
+		es.Run(ctx) // stops when the shutdown signal cancels ctx
+	}()
+	log.Info("runtime: reconciler + event source activated", zap.Duration("periodic_interval", cfg.ReconcileInterval))
 
 	// Periodic rediscovery. HealthController (above) only re-checks backends
 	// already in the registry — by its own Layer 5 contract it must never
@@ -604,7 +691,7 @@ func runProxy(log *zap.Logger, version string) error {
 	}
 
 	// Wait for EventSource to actually stop — not just for ctx to be
-	// cancelled — before the deferred reconcilerDocker.Close() above runs.
+	// cancelled — before the deferred dockerClient.Close() above runs.
 	// EventSource logs "eventsource: stopped" itself once this returns.
 	// No fixed timeout: shutdown is bounded by cfg.DrainTimeout above and
 	// by ReconcileOnce's own bounded Docker calls, not by anything this
@@ -746,6 +833,7 @@ func executeRecovery(
 	cfg *config.ProxyConfig,
 	sm *state.StateManager,
 	reg *proxy.Registry,
+	project string,
 	service string,
 	mc *metrics.MetricsCollector,
 	debugHandler *api.DebugHandler,
@@ -785,7 +873,7 @@ func executeRecovery(
 	defer retryCancel()
 
 	var source *proxy.DockerRecoverySource
-	source, err := proxy.NewDockerRecoverySourceWithConfig(service, log, cfg.TCPDialTimeout, 10)
+	source, err := proxy.NewDockerRecoverySourceWithConfig(project, service, log, cfg.TCPDialTimeout, 10)
 	for err != nil && retryCtx.Err() == nil {
 		log.Warn("recovery: docker daemon unreachable, retrying within startup budget",
 			zap.Error(err))
@@ -793,7 +881,7 @@ func executeRecovery(
 		case <-time.After(time.Second):
 		case <-retryCtx.Done():
 		}
-		source, err = proxy.NewDockerRecoverySourceWithConfig(service, log, cfg.TCPDialTimeout, 10)
+		source, err = proxy.NewDockerRecoverySourceWithConfig(project, service, log, cfg.TCPDialTimeout, 10)
 	}
 	if err != nil {
 		log.Warn("recovery: docker unavailable, generating degraded plan",
@@ -1080,6 +1168,7 @@ func executeRecoveryForProject(
 	cfg *config.ProxyConfig,
 	sm *state.StateManager,
 	pr *proxy.ProjectRegistry,
+	project string,
 	mc *metrics.MetricsCollector,
 	debugHandler *api.DebugHandler,
 	log *zap.Logger,
@@ -1101,7 +1190,7 @@ func executeRecoveryForProject(
 		// sites: the field rides along on every call made through this
 		// logger, not because each statement was individually edited.
 		serviceLog := log.With(zap.String("service", service))
-		st, plan, result, err := executeRecovery(ctx, cfg, sm, reg, service, mc, debugHandler, serviceLog)
+		st, plan, result, err := executeRecovery(ctx, cfg, sm, reg, project, service, mc, debugHandler, serviceLog)
 		results[service] = serviceRecoveryOutcome{State: st, Plan: plan, Result: result, Err: err}
 		// Deliberately no early return/break on err or a failed state — one
 		// service's outcome must never prevent the remaining services from

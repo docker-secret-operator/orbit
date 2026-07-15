@@ -171,10 +171,17 @@ type RolloutState struct {
 // Runtime abstracts container runtime operations used by rollout orchestration.
 type Runtime interface {
 	Pull(ctx context.Context, composeFile, service string) error
-	ServiceReplicaCount(ctx context.Context, service string) (int, error)
+
+	// ResolveProject resolves the exact Compose project this invocation is
+	// running against (ADR-0007 PR-B) — via Compose's own config
+	// resolution, never inferred from cwd/service/container name. Called
+	// once per Run invocation, before any discovery call.
+	ResolveProject(ctx context.Context, composeFile string) (string, error)
+
+	ServiceReplicaCount(ctx context.Context, project, service string) (int, error)
 	ScaleService(ctx context.Context, composeFile, service string, replicas int) error
-	WaitForNewContainer(ctx context.Context, opts Options, log *zap.Logger) (id, addr string, err error)
-	FindOldContainer(ctx context.Context, service, newID string) (string, error)
+	WaitForNewContainer(ctx context.Context, project string, opts Options, log *zap.Logger) (id, addr string, err error)
+	FindOldContainer(ctx context.Context, project, service, newID string) (string, error)
 	ContainerAddr(ctx context.Context, id string) (string, error)
 	RemoveContainer(ctx context.Context, id string) error
 
@@ -331,6 +338,18 @@ func runWithDeps(ctx context.Context, opts Options, log *zap.Logger, deps runDep
 		zap.String("service", opts.Service),
 		zap.String("compose", opts.ComposeFile))
 
+	// ADR-0007 PR-B: resolve this invocation's exact Compose project once,
+	// before any discovery call — a raw `docker ps`/`docker inspect` filter
+	// cannot be scoped to "the right project" before the invocation knows
+	// what that project is. project is a plain local variable, scoped to
+	// this one Run invocation — never a package-level variable, never
+	// re-derived after this call, threaded explicitly into every
+	// subsequent discovery call alongside the existing service parameter.
+	project, err := deps.runtime.ResolveProject(ctx, opts.ComposeFile)
+	if err != nil {
+		return fmt.Errorf("rollout: resolve compose project: %w", err)
+	}
+
 	// ── Step 1: Pull new image ────────────────────────────────────────────
 	if opts.Pull {
 		log.Info("rollout: pulling image", zap.String("service", opts.Service))
@@ -341,7 +360,7 @@ func runWithDeps(ctx context.Context, opts Options, log *zap.Logger, deps runDep
 	}
 
 	// ── Step 2: Scale to +1 ───────────────────────────────────────────────
-	currentReplicas, err := deps.runtime.ServiceReplicaCount(ctx, opts.Service)
+	currentReplicas, err := deps.runtime.ServiceReplicaCount(ctx, project, opts.Service)
 	if err != nil {
 		return fmt.Errorf("rollout: detect current replicas: %w", err)
 	}
@@ -354,7 +373,7 @@ func runWithDeps(ctx context.Context, opts Options, log *zap.Logger, deps runDep
 
 	// ── Step 3: Wait for healthcheck ──────────────────────────────────────
 	opts.report(PhaseHealthCheck, fmt.Sprintf("waiting up to %s for new container's healthcheck", opts.Timeout))
-	newID, newAddr, err := deps.runtime.WaitForNewContainer(ctx, opts, log)
+	newID, newAddr, err := deps.runtime.WaitForNewContainer(ctx, project, opts, log)
 	if err != nil {
 		// Cleanup: scale back down on healthcheck timeout.
 		_ = deps.runtime.ScaleService(ctx, opts.ComposeFile, opts.Service, currentReplicas)
@@ -367,7 +386,7 @@ func runWithDeps(ctx context.Context, opts Options, log *zap.Logger, deps runDep
 	opts.report(PhaseHealthCheck, fmt.Sprintf("container %s healthy at %s", shortID(newID), newAddr))
 
 	// ── Step 4: Find old container ID ────────────────────────────────────
-	oldID, err := deps.runtime.FindOldContainer(ctx, opts.Service, newID)
+	oldID, err := deps.runtime.FindOldContainer(ctx, project, opts.Service, newID)
 	if err != nil {
 		log.Warn("rollout: could not identify old container — skipping deregister",
 			zap.Error(err))
@@ -720,20 +739,24 @@ func (dockerRuntime) Pull(ctx context.Context, composeFile, service string) erro
 	return composeRun(ctx, composeFile, "pull", service)
 }
 
-func (dockerRuntime) ServiceReplicaCount(ctx context.Context, service string) (int, error) {
-	return serviceReplicaCount(ctx, service)
+func (dockerRuntime) ResolveProject(ctx context.Context, composeFile string) (string, error) {
+	return resolveComposeProject(ctx, composeFile)
+}
+
+func (dockerRuntime) ServiceReplicaCount(ctx context.Context, project, service string) (int, error) {
+	return serviceReplicaCount(ctx, project, service)
 }
 
 func (dockerRuntime) ScaleService(ctx context.Context, composeFile, service string, replicas int) error {
 	return scaleService(ctx, composeFile, service, replicas)
 }
 
-func (dockerRuntime) WaitForNewContainer(ctx context.Context, opts Options, log *zap.Logger) (id, addr string, err error) {
-	return waitForNewContainer(ctx, opts, log)
+func (dockerRuntime) WaitForNewContainer(ctx context.Context, project string, opts Options, log *zap.Logger) (id, addr string, err error) {
+	return waitForNewContainer(ctx, project, opts, log)
 }
 
-func (dockerRuntime) FindOldContainer(ctx context.Context, service, newID string) (string, error) {
-	return findOldContainer(ctx, service, newID)
+func (dockerRuntime) FindOldContainer(ctx context.Context, project, service, newID string) (string, error) {
+	return findOldContainer(ctx, project, service, newID)
 }
 
 func (dockerRuntime) ContainerAddr(ctx context.Context, id string) (string, error) {
@@ -798,9 +821,55 @@ func composeRun(ctx context.Context, file string, args ...string) error {
 	return nil
 }
 
+// resolveComposeProject resolves the exact Compose project this invocation
+// is running against (ADR-0007 Implementation Plan Part 2): it asks Compose
+// itself, via `docker compose -f <composeFile> config --format json`, and
+// reads the resolved top-level "name" field — never inferred from the
+// invoking directory, the service name, or a container name, and never
+// predicted independently of Compose's own resolution rules.
+//
+// This is a static, context-only resolution over the compose file plus the
+// invocation's inherited cwd/env — it requires no running container, which
+// is exactly what makes it usable for the zero-container bootstrap case
+// (initial deployment, scaled-to-zero, a fully recreated deployment): none
+// of those have a container to inspect, but the compose file always exists.
+func resolveComposeProject(ctx context.Context, composeFile string) (string, error) {
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composeFile, "config", "--format", "json")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("rollout: resolve compose project: docker compose -f %s config: %w\n%s", composeFile, err, stderr.String())
+	}
+
+	var parsed struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		return "", fmt.Errorf("rollout: resolve compose project: parse config output: %w", err)
+	}
+	if parsed.Name == "" {
+		return "", fmt.Errorf("rollout: resolve compose project: compose config for %s reported no project name", composeFile)
+	}
+	return parsed.Name, nil
+}
+
+// dockerPSFilterArgs builds the `docker ps` filter arguments shared by every
+// raw discovery call in this package (findOldContainer, serviceReplicaCount,
+// inspectNewestHealthy) — project and service are always required together
+// (ADR-0007 PR-B), so this is the one place that shape is constructed,
+// directly unit-testable without a real Docker daemon.
+func dockerPSFilterArgs(project, service string) []string {
+	return []string{
+		"--filter", "label=com.docker.compose.project=" + project,
+		"--filter", "label=com.docker.compose.service=" + service,
+		"--format", "{{.ID}}",
+	}
+}
+
 // waitForNewContainer polls for a second instance of the service to appear
 // and pass its healthcheck. Returns the container ID and its docker_rollout_mesh IP.
-func waitForNewContainer(ctx context.Context, opts Options, log *zap.Logger) (id, addr string, err error) {
+func waitForNewContainer(ctx context.Context, project string, opts Options, log *zap.Logger) (id, addr string, err error) {
 	deadline := time.Now().Add(opts.Timeout)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -814,7 +883,7 @@ func waitForNewContainer(ctx context.Context, opts Options, log *zap.Logger) (id
 				return "", "", fmt.Errorf("timeout (%s) waiting for healthy container", opts.Timeout)
 			}
 
-			id, addr, err = inspectNewestHealthy(ctx, opts.Service)
+			id, addr, err = inspectNewestHealthy(ctx, project, opts.Service)
 			if err == nil {
 				return id, addr, nil
 			}
@@ -826,11 +895,8 @@ func waitForNewContainer(ctx context.Context, opts Options, log *zap.Logger) (id
 // inspectNewestHealthy finds the most recently started container for the
 // service that is either healthy (has healthcheck) or running (no healthcheck).
 // Returns id and addr in "ip:port" form ready for the proxy control API.
-func inspectNewestHealthy(ctx context.Context, service string) (id, addr string, err error) {
-	out, err := exec.CommandContext(ctx, "docker", "ps",
-		"--filter", "label=com.docker.compose.service="+service,
-		"--format", "{{.ID}}",
-	).Output()
+func inspectNewestHealthy(ctx context.Context, project, service string) (id, addr string, err error) {
+	out, err := exec.CommandContext(ctx, "docker", append([]string{"ps"}, dockerPSFilterArgs(project, service)...)...).Output()
 	if err != nil {
 		return "", "", fmt.Errorf("docker ps: %w", err)
 	}
@@ -963,11 +1029,8 @@ func inspectHealthAndRunning(ctx context.Context, id string) (status string, run
 }
 
 // findOldContainer returns the ID of the container that is NOT the newID.
-func findOldContainer(ctx context.Context, service, newID string) (string, error) {
-	out, err := exec.CommandContext(ctx, "docker", "ps",
-		"--filter", "label=com.docker.compose.service="+service,
-		"--format", "{{.ID}}",
-	).Output()
+func findOldContainer(ctx context.Context, project, service, newID string) (string, error) {
+	out, err := exec.CommandContext(ctx, "docker", append([]string{"ps"}, dockerPSFilterArgs(project, service)...)...).Output()
 	if err != nil {
 		return "", fmt.Errorf("docker ps: %w", err)
 	}
@@ -1109,11 +1172,8 @@ func registerBackend(ctx context.Context, opts Options, id, addr string, log *za
 	return nil
 }
 
-func serviceReplicaCount(ctx context.Context, service string) (int, error) {
-	out, err := exec.CommandContext(ctx, "docker", "ps",
-		"--filter", "label=com.docker.compose.service="+service,
-		"--format", "{{.ID}}",
-	).Output()
+func serviceReplicaCount(ctx context.Context, project, service string) (int, error) {
+	out, err := exec.CommandContext(ctx, "docker", append([]string{"ps"}, dockerPSFilterArgs(project, service)...)...).Output()
 	if err != nil {
 		return 0, fmt.Errorf("docker ps: %w", err)
 	}

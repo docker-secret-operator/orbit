@@ -111,8 +111,11 @@ func newFakeContainer(containerID, service, backendID, ip, port, generation stri
 	inspect := types.ContainerJSON{
 		ContainerJSONBase: &types.ContainerJSONBase{ID: containerID},
 		Config: &container.Config{
-			Labels: map[string]string{"orbit.io/generation": generation},
-			Env:    []string{"ORBIT_BACKEND_ID=" + backendID, "ORBIT_BACKEND=" + service + ":" + port},
+			Labels: map[string]string{
+				"orbit.io/generation":        generation,
+				"com.docker.compose.project": "test-project",
+			},
+			Env: []string{"ORBIT_BACKEND_ID=" + backendID, "ORBIT_BACKEND=" + service + ":" + port},
 		},
 		NetworkSettings: &types.NetworkSettings{
 			Networks: map[string]*network.EndpointSettings{
@@ -150,7 +153,7 @@ func TestReconciler_EmptyRegistry_ContainersAdded(t *testing.T) {
 	pr := NewProjectRegistry()
 	pr.Register("web", reg)
 
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	rc.ReconcileOnce(context.Background())
 
 	b, ok := reg.Get("web-b1")
@@ -172,7 +175,7 @@ func TestReconciler_StaleRegistry_ContainersRemoved(t *testing.T) {
 	pr := NewProjectRegistry()
 	pr.Register("web", reg)
 
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	rc.ReconcileOnce(context.Background())
 
 	if _, ok := reg.Get("stale-1"); ok {
@@ -194,7 +197,7 @@ func TestReconciler_MixedState_Converges(t *testing.T) {
 	pr := NewProjectRegistry()
 	pr.Register("web", reg)
 
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	rc.ReconcileOnce(context.Background())
 
 	if _, ok := reg.Get("keep-1"); !ok {
@@ -228,7 +231,7 @@ func TestReconciler_OneServiceFailure_OthersContinue(t *testing.T) {
 	pr.Register("api", regAPI)
 
 	m := &spyReconcilerMetrics{}
-	rc := NewReconciler(pr, docker, m, nil)
+	rc := NewReconciler(pr, docker, "test-project", m, nil)
 	rc.ReconcileOnce(context.Background())
 
 	if _, ok := regWeb.Get("web-b1"); ok {
@@ -250,7 +253,7 @@ func TestReconciler_ContainerListFailure_RegistryUntouched(t *testing.T) {
 	pr.Register("web", reg)
 
 	m := &spyReconcilerMetrics{}
-	rc := NewReconciler(pr, docker, m, nil)
+	rc := NewReconciler(pr, docker, "test-project", m, nil)
 	rc.ReconcileOnce(context.Background())
 
 	if _, ok := reg.Get("b1"); !ok {
@@ -272,7 +275,7 @@ func TestReconciler_RegistryReplacement(t *testing.T) {
 	pr := NewProjectRegistry()
 	pr.Register("web", regOld)
 
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	rc.ReconcileOnce(context.Background())
 
 	if _, ok := regOld.Get("old-backend"); ok {
@@ -313,7 +316,7 @@ func TestReconciler_MissingRegistrySkippedSafely(t *testing.T) {
 	pr := NewProjectRegistry()
 	pr.Register("ghost", reg)
 
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	done := make(chan struct{})
 	go func() {
@@ -343,7 +346,7 @@ func TestReconciler_DuplicateReconciliation_Idempotent(t *testing.T) {
 	pr.Register("web", reg)
 
 	m := &spyReconcilerMetrics{}
-	rc := NewReconciler(pr, docker, m, nil)
+	rc := NewReconciler(pr, docker, "test-project", m, nil)
 	rc.ReconcileOnce(context.Background())
 	rc.ReconcileOnce(context.Background())
 
@@ -373,7 +376,7 @@ func TestReconciler_MultiServiceIsolation(t *testing.T) {
 	pr.Register("web", regWeb)
 	pr.Register("api", regAPI)
 
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	rc.ReconcileOnce(context.Background())
 
 	if _, ok := regWeb.Get("web-b1"); !ok {
@@ -396,7 +399,7 @@ func TestReconciler_MultiServiceIsolation(t *testing.T) {
 func TestReconciler_Run_Race(t *testing.T) {
 	docker := &fakeReconcileDocker{}
 	pr := NewProjectRegistry()
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go rc.Run(ctx, time.Millisecond)
@@ -438,7 +441,7 @@ func TestReconciler_DeterministicOrdering(t *testing.T) {
 	pr.Register("alpha", NewRegistry())
 	pr.Register("mike", NewRegistry())
 
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	rc.ReconcileOnce(context.Background())
 
 	got := docker.order()
@@ -463,7 +466,7 @@ func TestReconciler_LogsCarryServiceField(t *testing.T) {
 	core, observed := observer.New(zapcore.InfoLevel)
 	log := zap.New(core)
 
-	rc := NewReconciler(pr, docker, nil, log)
+	rc := NewReconciler(pr, docker, "test-project", nil, log)
 	rc.ReconcileOnce(context.Background())
 
 	var webTagged, apiTagged, untagged int
@@ -502,7 +505,7 @@ func TestReconciler_UnlabeledContainerIgnored(t *testing.T) {
 	pr := NewProjectRegistry()
 	pr.Register("web", reg)
 
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	rc.ReconcileOnce(context.Background()) // must not panic
 
 	if reg.Len() != 0 {
@@ -522,7 +525,7 @@ func TestReconciler_ProxyContainerIgnored(t *testing.T) {
 	pr := NewProjectRegistry()
 	pr.Register("web", reg)
 
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	rc.ReconcileOnce(context.Background())
 
 	if reg.Len() != 0 {
@@ -545,7 +548,7 @@ func TestReconciler_RecordsMetrics(t *testing.T) {
 	pr.Register("web", reg)
 
 	m := &spyReconcilerMetrics{}
-	rc := NewReconciler(pr, docker, m, nil)
+	rc := NewReconciler(pr, docker, "test-project", m, nil)
 	rc.ReconcileOnce(context.Background())
 
 	if m.runs.Load() != 1 {
@@ -569,14 +572,14 @@ func TestReconciler_NilMetricsSafe(t *testing.T) {
 	docker := &fakeReconcileDocker{}
 	pr := NewProjectRegistry()
 	pr.Register("web", NewRegistry())
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	rc.ReconcileOnce(context.Background()) // must not panic with nil metrics/logger
 }
 
 func TestReconciler_EmptyProjectRegistry(t *testing.T) {
 	docker := &fakeReconcileDocker{}
 	pr := NewProjectRegistry()
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	rc.ReconcileOnce(context.Background()) // must not panic
 }
 
@@ -599,7 +602,7 @@ func TestReconciler_ProxyContainerExclusion_Logged(t *testing.T) {
 	core, observed := observer.New(zapcore.WarnLevel)
 	log := zap.New(core)
 
-	rc := NewReconciler(pr, docker, nil, log)
+	rc := NewReconciler(pr, docker, "test-project", nil, log)
 	rc.ReconcileOnce(context.Background())
 
 	// Behavior unchanged: still never reconciled, still never inspected.
@@ -641,7 +644,7 @@ func TestReconciler_EmptyServiceLabelExclusion_Logged(t *testing.T) {
 	core, observed := observer.New(zapcore.WarnLevel)
 	log := zap.New(core)
 
-	rc := NewReconciler(pr, docker, nil, log)
+	rc := NewReconciler(pr, docker, "test-project", nil, log)
 	rc.ReconcileOnce(context.Background())
 
 	if reg.Len() != 0 {
@@ -680,7 +683,7 @@ func TestReconciler_GroupingExclusions_BehaviorUnchanged(t *testing.T) {
 	pr.Register("web", reg)
 
 	m := &spyReconcilerMetrics{}
-	rc := NewReconciler(pr, docker, m, nil)
+	rc := NewReconciler(pr, docker, "test-project", m, nil)
 	rc.ReconcileOnce(context.Background())
 
 	if reg.Len() != 1 {
@@ -721,7 +724,7 @@ func TestReconciler_BackendIDCollision_Logged(t *testing.T) {
 	log := zap.New(core)
 
 	m := &spyReconcilerMetrics{}
-	rc := NewReconciler(pr, docker, m, log)
+	rc := NewReconciler(pr, docker, "test-project", m, log)
 	rc.ReconcileOnce(context.Background())
 
 	// Registry remains consistent: exactly one backend, reconciliation
@@ -789,7 +792,7 @@ func TestReconciler_BackendIDCollision_DeterministicAcrossRepeatedPasses(t *test
 	pr := NewProjectRegistry()
 	pr.Register("web", reg)
 
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	for i := 0; i < 5; i++ {
 		rc.ReconcileOnce(context.Background())
 		b, ok := reg.Get("dup-id")
@@ -818,7 +821,7 @@ func TestReconciler_ReentrancyGuard_RejectsConcurrentInvocation(t *testing.T) {
 	m := &spyReconcilerMetrics{}
 	core, observed := observer.New(zapcore.WarnLevel)
 	log := zap.New(core)
-	rc := NewReconciler(pr, docker, m, log)
+	rc := NewReconciler(pr, docker, "test-project", m, log)
 
 	firstDone := make(chan struct{})
 	go func() {
@@ -883,7 +886,7 @@ func TestReconciler_ReentrancyGuard_ResetsAfterCompletion(t *testing.T) {
 	pr.Register("web", reg)
 
 	m := &spyReconcilerMetrics{}
-	rc := NewReconciler(pr, docker, m, nil)
+	rc := NewReconciler(pr, docker, "test-project", m, nil)
 
 	rc.ReconcileOnce(context.Background())
 	rc.ReconcileOnce(context.Background())
@@ -915,7 +918,7 @@ func TestReconciler_ReentrancyGuard_Race(t *testing.T) {
 	pr.Register("web", reg)
 
 	m := &spyReconcilerMetrics{}
-	rc := NewReconciler(pr, docker, m, nil)
+	rc := NewReconciler(pr, docker, "test-project", m, nil)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
@@ -935,5 +938,128 @@ func TestReconciler_ReentrancyGuard_Race(t *testing.T) {
 	}
 	if m.runs.Load() == 0 {
 		t.Fatal("expected at least 1 call to actually run, got 0")
+	}
+}
+
+// ── ADR-0007 PR-A: project-scoped ownership ─────────────────────────────────
+
+func TestCheckProjectOwnership_Match(t *testing.T) {
+	if err := checkProjectOwnership("proj-a", "proj-a"); err != nil {
+		t.Errorf("expected no error for matching projects, got %v", err)
+	}
+}
+
+func TestCheckProjectOwnership_Mismatch(t *testing.T) {
+	if err := checkProjectOwnership("proj-b", "proj-a"); err == nil {
+		t.Error("expected an error for mismatched projects, got nil")
+	}
+}
+
+func TestCheckProjectOwnership_EmptyContainerProject(t *testing.T) {
+	if err := checkProjectOwnership("", "proj-a"); err == nil {
+		t.Error("expected an error when the container has no project label, got nil")
+	}
+}
+
+// TestReconciler_TwoProjectsSameService_RejectsForeignProject is ADR-0007
+// §22's required regression test: two Compose projects with an identical
+// service name ("web"), a container from each, only the project label
+// distinguishing them. Reconciler must register only the container whose
+// project matches this proxy's own resolved identity, never the foreign
+// project's — even though every other label (orbit.io/managed,
+// orbit.io/service) is identical.
+func TestReconciler_TwoProjectsSameService_RejectsForeignProject(t *testing.T) {
+	ownContainer, ownInspect := newFakeContainer("cid-own", "web", "web-owned", "10.0.0.1", "3000", "gen-1")
+	foreignContainer, foreignInspect := newFakeContainer("cid-foreign", "web", "web-foreign", "10.0.0.2", "3000", "gen-1")
+	foreignInspect.Config.Labels["com.docker.compose.project"] = "other-project"
+
+	docker := &fakeReconcileDocker{
+		containers: []types.Container{ownContainer, foreignContainer},
+		inspects: map[string]types.ContainerJSON{
+			"cid-own":     ownInspect,
+			"cid-foreign": foreignInspect,
+		},
+	}
+	reg := NewRegistry()
+	pr := NewProjectRegistry()
+	pr.Register("web", reg)
+
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
+	rc.ReconcileOnce(context.Background())
+
+	if _, ok := reg.Get("web-owned"); !ok {
+		t.Error("expected web-owned (same project) to be registered")
+	}
+	if _, ok := reg.Get("web-foreign"); ok {
+		t.Error("expected web-foreign (different project, identical service label) to be rejected, but it was registered")
+	}
+	if reg.Len() != 1 {
+		t.Fatalf("expected exactly 1 backend registered, got %d", reg.Len())
+	}
+}
+
+// TestReconciler_ForeignProjectRejection_DoesNotCountAsReconciliationFailure
+// is the PR-A review's Finding 1 regression test: an expected ownership
+// rejection (a foreign project's container, correctly skipped) must not be
+// indistinguishable from a genuine reconciliation problem — it must not
+// increment IncReconciliationFailures. In the exact multi-project,
+// shared-host topology ADR-0007 makes safe, a foreign-project container
+// sharing a service name is the *normal*, continuous steady state, not an
+// anomaly.
+func TestReconciler_ForeignProjectRejection_DoesNotCountAsReconciliationFailure(t *testing.T) {
+	ownContainer, ownInspect := newFakeContainer("cid-own", "web", "web-owned", "10.0.0.1", "3000", "gen-1")
+	foreignContainer, foreignInspect := newFakeContainer("cid-foreign", "web", "web-foreign", "10.0.0.2", "3000", "gen-1")
+	foreignInspect.Config.Labels["com.docker.compose.project"] = "other-project"
+
+	docker := &fakeReconcileDocker{
+		containers: []types.Container{ownContainer, foreignContainer},
+		inspects: map[string]types.ContainerJSON{
+			"cid-own":     ownInspect,
+			"cid-foreign": foreignInspect,
+		},
+	}
+	reg := NewRegistry()
+	pr := NewProjectRegistry()
+	pr.Register("web", reg)
+
+	m := &spyReconcilerMetrics{}
+	rc := NewReconciler(pr, docker, "test-project", m, nil)
+	rc.ReconcileOnce(context.Background())
+
+	if m.failures.Load() != 0 {
+		t.Errorf("expected an expected ownership rejection to count 0 reconciliation failures, got %d", m.failures.Load())
+	}
+	if _, ok := reg.Get("web-owned"); !ok {
+		t.Error("expected the owned-project container to still be registered")
+	}
+	if _, ok := reg.Get("web-foreign"); ok {
+		t.Error("expected the foreign-project container to still be rejected")
+	}
+}
+
+// TestReconciler_GenuineInspectError_StillCountsAsReconciliationFailure is
+// the companion regression test: fixing Finding 1 must not suppress real
+// problems. A genuine Docker inspect failure (daemon error, transient
+// unavailability, etc.) is not ownership filtering and must still increment
+// IncReconciliationFailures exactly as before.
+func TestReconciler_GenuineInspectError_StillCountsAsReconciliationFailure(t *testing.T) {
+	c1, _ := newFakeContainer("cid1", "web", "web-b1", "10.0.0.1", "3000", "gen-1")
+	docker := &fakeReconcileDocker{
+		containers:  []types.Container{c1},
+		inspectErrs: map[string]error{"cid1": errors.New("docker daemon error")},
+	}
+	reg := NewRegistry()
+	pr := NewProjectRegistry()
+	pr.Register("web", reg)
+
+	m := &spyReconcilerMetrics{}
+	rc := NewReconciler(pr, docker, "test-project", m, nil)
+	rc.ReconcileOnce(context.Background())
+
+	if m.failures.Load() != 1 {
+		t.Errorf("expected a genuine inspect error to still count as 1 reconciliation failure, got %d", m.failures.Load())
+	}
+	if reg.Len() != 0 {
+		t.Errorf("expected no backend registered when inspect fails, got %d", reg.Len())
 	}
 }

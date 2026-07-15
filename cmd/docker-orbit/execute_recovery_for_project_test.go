@@ -75,7 +75,7 @@ func TestExecuteRecoveryForProject_MultipleServicesIndependent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	results := executeRecoveryForProject(ctx, cfg, sm, pr, mc, debugHandler, log)
+	results := executeRecoveryForProject(ctx, cfg, sm, pr, "test-project", mc, debugHandler, log)
 
 	if len(results) != 2 {
 		t.Fatalf("want 2 results, got %d: %v", len(results), results)
@@ -124,7 +124,7 @@ func TestExecuteRecoveryForProject_EmptyProjectRegistry(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	results := executeRecoveryForProject(ctx, cfg, sm, pr, mc, debugHandler, zap.NewNop())
+	results := executeRecoveryForProject(ctx, cfg, sm, pr, "test-project", mc, debugHandler, zap.NewNop())
 	if len(results) != 0 {
 		t.Fatalf("want 0 results for an empty ProjectRegistry, got %d", len(results))
 	}
@@ -152,7 +152,7 @@ func TestExecuteRecoveryForProject_ContinuesAfterServiceIssue(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	results := executeRecoveryForProject(ctx, cfg, sm, pr, mc, debugHandler, zap.NewNop())
+	results := executeRecoveryForProject(ctx, cfg, sm, pr, "test-project", mc, debugHandler, zap.NewNop())
 
 	if _, ok := results["aaa-broken"]; !ok {
 		t.Error("the broken service must still have produced an outcome, not aborted the loop")
@@ -185,7 +185,7 @@ func TestExecuteRecoveryForProject_RegistryReplacement(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	executeRecoveryForProject(ctx, cfg, sm, pr, mc, debugHandler, zap.NewNop())
+	executeRecoveryForProject(ctx, cfg, sm, pr, "test-project", mc, debugHandler, zap.NewNop())
 
 	regB := proxy.NewRegistry()
 	if err := regB.Add(proxy.Backend{ID: "regB-marker", Addr: "10.2.2.2:80"}); err != nil {
@@ -193,7 +193,7 @@ func TestExecuteRecoveryForProject_RegistryReplacement(t *testing.T) {
 	}
 	pr.Register("web", regB) // replace
 
-	executeRecoveryForProject(ctx, cfg, sm, pr, mc, debugHandler, zap.NewNop())
+	executeRecoveryForProject(ctx, cfg, sm, pr, "test-project", mc, debugHandler, zap.NewNop())
 
 	aBackends := regA.Backends()
 	if len(aBackends) != 1 || aBackends[0].ID != "regA-marker" {
@@ -230,7 +230,7 @@ func TestExecuteRecoveryForProject_ConcurrentServiceRemoval(t *testing.T) {
 		pr.Remove("api") // races with executeRecoveryForProject's loop below
 	}()
 
-	executeRecoveryForProject(ctx, cfg, sm, pr, mc, debugHandler, zap.NewNop()) // must not panic
+	executeRecoveryForProject(ctx, cfg, sm, pr, "test-project", mc, debugHandler, zap.NewNop()) // must not panic
 
 	wg.Wait()
 }
@@ -262,7 +262,7 @@ func TestExecuteRecoveryForProject_LogsCarryServiceField(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	executeRecoveryForProject(ctx, cfg, sm, pr, mc, debugHandler, log)
+	executeRecoveryForProject(ctx, cfg, sm, pr, "test-project", mc, debugHandler, log)
 
 	if len(observed.All()) == 0 {
 		t.Fatal("expected at least some log output from the recovery pass")

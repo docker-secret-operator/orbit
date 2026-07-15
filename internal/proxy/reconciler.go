@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -42,10 +43,11 @@ type ReconcilerMetrics interface {
 // implemented) would otherwise miss. Removing or consolidating the recovery
 // loop is deferred to a later gated PR (PR 4.6).
 type Reconciler struct {
-	pr      *ProjectRegistry
-	docker  containerLister
-	metrics ReconcilerMetrics
-	log     *zap.Logger
+	pr         *ProjectRegistry
+	docker     containerLister
+	ownProject string
+	metrics    ReconcilerMetrics
+	log        *zap.Logger
 
 	// running enforces the re-entrancy guard: only one ReconcileOnce call
 	// may execute at a time, enforced by the type itself rather than by
@@ -58,13 +60,17 @@ type Reconciler struct {
 
 // NewReconciler builds a Reconciler. docker is the frozen PR 4.1 seam
 // (internal/proxy/docker_seam.go) — Reconciler never constructs its own
-// Docker client and never depends on DockerRecoverySource. A nil logger
+// Docker client and never depends on DockerRecoverySource. ownProject is
+// this proxy process's own Compose project, resolved once via self-
+// inspection at startup (cmd/docker-orbit/main.go's
+// resolveOwnProjectIdentity, ADR-0007 §7/§9/§10) and passed through
+// explicitly — Reconciler never re-derives or persists it. A nil logger
 // defaults to no-op.
-func NewReconciler(pr *ProjectRegistry, docker containerLister, m ReconcilerMetrics, log *zap.Logger) *Reconciler {
+func NewReconciler(pr *ProjectRegistry, docker containerLister, ownProject string, m ReconcilerMetrics, log *zap.Logger) *Reconciler {
 	if log == nil {
 		log = zap.NewNop()
 	}
-	return &Reconciler{pr: pr, docker: docker, metrics: m, log: log}
+	return &Reconciler{pr: pr, docker: docker, ownProject: ownProject, metrics: m, log: log}
 }
 
 // Run ticks ReconcileOnce on interval until ctx is cancelled. It blocks; run
@@ -199,6 +205,15 @@ func (rc *Reconciler) reconcileService(ctx context.Context, reg *Registry, live 
 	for _, c := range live {
 		b, err := rc.extractBackend(ctx, c)
 		if err != nil {
+			if errors.Is(err, errOwnershipRejected) {
+				// Expected, routine outcome (PR-A review Finding 1) — a
+				// foreign project's container correctly rejected. Logged
+				// for visibility, but never counted toward
+				// IncReconciliationFailures: this is ownership filtering
+				// working as designed, not a reconciliation problem.
+				log.Debug("reconcile: skip container (ownership)", zap.String("container", shortContainerID(c.ID)), zap.Error(err))
+				continue
+			}
 			log.Warn("reconcile: skip container", zap.String("container", shortContainerID(c.ID)), zap.Error(err))
 			failed = true
 			continue
@@ -264,6 +279,10 @@ func (rc *Reconciler) extractBackend(ctx context.Context, c types.Container) (*B
 		return nil, fmt.Errorf("inspect: %w", err)
 	}
 
+	if err := checkProjectOwnership(inspect.Config.Labels["com.docker.compose.project"], rc.ownProject); err != nil {
+		return nil, err
+	}
+
 	generation := inspect.Config.Labels["orbit.io/generation"]
 
 	var backendID string
@@ -300,6 +319,38 @@ func (rc *Reconciler) extractBackend(ctx context.Context, c types.Container) (*B
 		Addr:       net.JoinHostPort(ip, port),
 		Generation: generation,
 	}, nil
+}
+
+// errOwnershipRejected marks a container skipped by the project-ownership
+// check (checkProjectOwnership) as an *expected*, routine outcome — not a
+// reconciliation failure. In any legitimate multi-project, shared-host
+// deployment (the exact topology ADR-0007 makes safe), a foreign project's
+// container sharing a service name will be seen and correctly rejected on
+// every single reconciliation pass — that is the feature working, not a
+// problem. Callers use errors.Is(err, errOwnershipRejected) to distinguish
+// this from a genuine Docker/extraction error (PR-A review Finding 1).
+var errOwnershipRejected = errors.New("container rejected by ownership check")
+
+// checkProjectOwnership evaluates the project-match component of the
+// ownership tuple (ADR-0007 §9): a container proves this proxy's ownership
+// only if its com.docker.compose.project label equals the value this
+// process resolved about itself via self-inspection (ownProject). Shared
+// verbatim by Reconciler.extractBackend and
+// DockerRecoverySource.extractBackend so both components evaluate ownership
+// identically, per ADR-0007 §14 — never two independently-written checks
+// that could silently drift apart. An empty containerProject (missing
+// label) is always rejected: ADR-0007 §15 requires skipping, never
+// defaulting an unlabeled container to "owned." Every returned error wraps
+// errOwnershipRejected so callers can distinguish this expected outcome from
+// a genuine reconciliation/recovery failure.
+func checkProjectOwnership(containerProject, ownProject string) error {
+	if containerProject == "" {
+		return fmt.Errorf("%w: missing com.docker.compose.project label", errOwnershipRejected)
+	}
+	if containerProject != ownProject {
+		return fmt.Errorf("%w: container belongs to %q, this proxy owns %q", errOwnershipRejected, containerProject, ownProject)
+	}
+	return nil
 }
 
 func shortContainerID(id string) string {

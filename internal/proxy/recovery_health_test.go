@@ -296,3 +296,70 @@ func TestVerifyBackendByID_FailsClosed(t *testing.T) {
 		})
 	}
 }
+
+// ── PR-A review Finding 2: Recovery ownership decision coverage ────────────
+//
+// DockerRecoverySource.extractBackend cannot be exercised directly in a unit
+// test: d.client is a concrete *client.Client (not an interface), and
+// introducing one purely for testability, or restructuring
+// DockerRecoverySource itself, was explicitly ruled out when this finding
+// was scoped — that would be redesigning Recovery for test convenience, not
+// closing a review finding. checkRecoveryOwnership is the ownership-only
+// decision logic extracted out of extractBackend's body (no Docker I/O,
+// same file, same technique already used and accepted for
+// checkProjectOwnership) — these tests exercise that real, unmodified
+// function, proving the exact decision extractBackend makes. What remains
+// unverified by an automated test is extractBackend's Docker I/O itself
+// (ContainerInspect, network/port extraction) — that is covered by the
+// PR-A live-verification pass against a real daemon, not by this test file.
+
+func TestCheckRecoveryOwnership_AcceptsOwnedProject(t *testing.T) {
+	labels := map[string]string{
+		"orbit.io/service":           "web",
+		"orbit.io/proxy":             "false",
+		"orbit.io/generation":        "web-default",
+		"com.docker.compose.project": "proj-a",
+	}
+	if err := checkRecoveryOwnership(labels, "proj-a", "web"); err != nil {
+		t.Errorf("expected an owned-project container to be accepted, got %v", err)
+	}
+}
+
+func TestCheckRecoveryOwnership_RejectsForeignProject(t *testing.T) {
+	labels := map[string]string{
+		"orbit.io/service":           "web",
+		"orbit.io/proxy":             "false",
+		"orbit.io/generation":        "web-default",
+		"com.docker.compose.project": "proj-b",
+	}
+	err := checkRecoveryOwnership(labels, "proj-a", "web")
+	if err == nil {
+		t.Fatal("expected a foreign-project container to be rejected, got nil")
+	}
+	if !errors.Is(err, errOwnershipRejected) {
+		t.Errorf("expected the rejection to wrap errOwnershipRejected, got %v", err)
+	}
+}
+
+func TestCheckRecoveryOwnership_RejectsIncompleteLabels(t *testing.T) {
+	labels := map[string]string{
+		"com.docker.compose.project": "proj-a",
+		// orbit.io/service, orbit.io/proxy, orbit.io/generation all missing.
+	}
+	if err := checkRecoveryOwnership(labels, "proj-a", "web"); err == nil {
+		t.Error("expected incomplete ownership labels to be rejected, got nil")
+	}
+}
+
+func TestCheckRecoveryOwnership_RejectsMismatchedProxyInstance(t *testing.T) {
+	labels := map[string]string{
+		"orbit.io/service":           "web",
+		"orbit.io/proxy":             "false",
+		"orbit.io/generation":        "web-default",
+		"com.docker.compose.project": "proj-a",
+		"orbit.io/proxy-instance":    "other-instance",
+	}
+	if err := checkRecoveryOwnership(labels, "proj-a", "web"); err == nil {
+		t.Error("expected a mismatched proxy-instance label to be rejected, got nil")
+	}
+}

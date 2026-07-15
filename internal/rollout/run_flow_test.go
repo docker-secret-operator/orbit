@@ -11,35 +11,48 @@ import (
 )
 
 type fakeRuntime struct {
-	pullErr          error
-	replicaCount     int
-	replicaCountErr  error
-	scaleErr         error
-	waitID           string
-	waitAddr         string
-	waitErr          error
-	oldID            string
-	findOldErr       error
-	containerAddr    string
-	containerAddrErr error
-	removeErr        error
-	verifyStableErr  error
-	scaleCalls       []int
-	removedIDs       []string
+	pullErr             error
+	resolveProjectName  string
+	resolveProjectErr   error
+	resolveProjectCalls int
+	replicaCount        int
+	replicaCountErr     error
+	replicaCountProject []string // project arg captured on each call, for threading assertions
+	scaleErr            error
+	waitID              string
+	waitAddr            string
+	waitErr             error
+	waitProject         []string
+	oldID               string
+	findOldErr          error
+	findOldProject      []string
+	containerAddr       string
+	containerAddrErr    error
+	removeErr           error
+	verifyStableErr     error
+	scaleCalls          []int
+	removedIDs          []string
 }
 
 func (f *fakeRuntime) Pull(context.Context, string, string) error { return f.pullErr }
-func (f *fakeRuntime) ServiceReplicaCount(context.Context, string) (int, error) {
+func (f *fakeRuntime) ResolveProject(context.Context, string) (string, error) {
+	f.resolveProjectCalls++
+	return f.resolveProjectName, f.resolveProjectErr
+}
+func (f *fakeRuntime) ServiceReplicaCount(_ context.Context, project, _ string) (int, error) {
+	f.replicaCountProject = append(f.replicaCountProject, project)
 	return f.replicaCount, f.replicaCountErr
 }
 func (f *fakeRuntime) ScaleService(_ context.Context, _ string, _ string, replicas int) error {
 	f.scaleCalls = append(f.scaleCalls, replicas)
 	return f.scaleErr
 }
-func (f *fakeRuntime) WaitForNewContainer(context.Context, Options, *zap.Logger) (string, string, error) {
+func (f *fakeRuntime) WaitForNewContainer(_ context.Context, project string, _ Options, _ *zap.Logger) (string, string, error) {
+	f.waitProject = append(f.waitProject, project)
 	return f.waitID, f.waitAddr, f.waitErr
 }
-func (f *fakeRuntime) FindOldContainer(context.Context, string, string) (string, error) {
+func (f *fakeRuntime) FindOldContainer(_ context.Context, project, _, _ string) (string, error) {
+	f.findOldProject = append(f.findOldProject, project)
 	return f.oldID, f.findOldErr
 }
 func (f *fakeRuntime) ContainerAddr(context.Context, string) (string, error) {
@@ -267,5 +280,75 @@ func TestRunWithDeps_HappyPath_PersistsAuthorityAtCorrectPoints(t *testing.T) {
 	}
 	if commitIdx < deregisterIdx {
 		t.Errorf("call order = %v; commit (%d) must come after deregister (%d)", ctrl.callOrder, commitIdx, deregisterIdx)
+	}
+}
+
+// ── ADR-0007 PR-B: project-aware rollout discovery ──────────────────────────
+
+// TestRunWithDeps_ResolvesProjectOnceAndThreadsIntoDiscoveryCalls proves the
+// invariant from ADR-0007's Implementation Plan Part 2: a resolved project
+// value is computed exactly once per Run invocation, then passed explicitly
+// into every subsequent discovery call — never re-resolved, never diverging
+// between calls.
+func TestRunWithDeps_ResolvesProjectOnceAndThreadsIntoDiscoveryCalls(t *testing.T) {
+	rt := &fakeRuntime{
+		resolveProjectName: "proj-a",
+		replicaCount:       1,
+		waitID:             "newcontainer123456",
+		waitAddr:           "10.0.0.2:3000",
+		oldID:              "oldcontainer123456",
+		containerAddr:      "10.0.0.1:3000",
+	}
+	ctrl := &fakeControl{}
+	st := &fakeStateStore{}
+
+	err := runWithDeps(
+		context.Background(),
+		Options{Service: "web", ComposeFile: "docker-rollout-compose.yml", ControlAddr: "http://localhost:9900"},
+		zap.NewNop(),
+		runDeps{runtime: rt, control: ctrl, state: st},
+	)
+	if err != nil {
+		t.Fatalf("runWithDeps error = %v, want nil", err)
+	}
+
+	if rt.resolveProjectCalls != 1 {
+		t.Errorf("ResolveProject called %d times, want exactly 1", rt.resolveProjectCalls)
+	}
+	for _, got := range append(append([]string{}, rt.replicaCountProject...), append(rt.waitProject, rt.findOldProject...)...) {
+		if got != "proj-a" {
+			t.Errorf("discovery call received project %q, want %q (must match the single resolved value)", got, "proj-a")
+		}
+	}
+}
+
+// TestRunWithDeps_ResolveComposeProjectFails_AbortsBeforeAnyDiscovery proves
+// the rollout fails immediately, with a clear error, if the Compose project
+// cannot be resolved — never falling back to an unscoped or guessed value.
+func TestRunWithDeps_ResolveComposeProjectFails_AbortsBeforeAnyDiscovery(t *testing.T) {
+	rt := &fakeRuntime{resolveProjectErr: errors.New("docker compose config: exit status 1")}
+	ctrl := &fakeControl{}
+	st := &fakeStateStore{}
+
+	err := runWithDeps(
+		context.Background(),
+		Options{Service: "web", ComposeFile: "docker-rollout-compose.yml", ControlAddr: "http://localhost:9900"},
+		zap.NewNop(),
+		runDeps{runtime: rt, control: ctrl, state: st},
+	)
+	if err == nil {
+		t.Fatal("expected an error when compose project resolution fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "resolve compose project") {
+		t.Errorf("error should clearly name the failed operation, got: %v", err)
+	}
+	if rt.replicaCountProject != nil || rt.waitProject != nil || rt.findOldProject != nil {
+		t.Error("expected no discovery call to happen after project resolution failed")
+	}
+	if len(rt.scaleCalls) != 0 {
+		t.Errorf("expected no scale call after project resolution failed, got %v", rt.scaleCalls)
+	}
+	if st.saved {
+		t.Error("expected no rollout state to be saved after project resolution failed")
 	}
 }

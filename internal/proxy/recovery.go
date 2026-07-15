@@ -30,6 +30,7 @@ var ErrNotIDVerifiable = errors.New("backend ID not eligible for direct verifica
 type DockerRecoverySource struct {
 	client           *client.Client
 	proxyInstance    string
+	project          string
 	log              *zap.Logger
 	healthValidator  *HealthValidator
 	tcpDialTimeout   time.Duration
@@ -37,12 +38,16 @@ type DockerRecoverySource struct {
 }
 
 // NewDockerRecoverySource creates a recovery source with Docker SDK and health validation.
-func NewDockerRecoverySource(proxyInstance string, log *zap.Logger) (*DockerRecoverySource, error) {
-	return NewDockerRecoverySourceWithConfig(proxyInstance, log, 2*time.Second, 10)
+// project is this proxy process's own Compose project, resolved once via
+// self-inspection at startup (cmd/docker-orbit/main.go's
+// resolveOwnProjectIdentity, ADR-0007 §7/§9/§10) and passed through
+// explicitly — never re-derived here.
+func NewDockerRecoverySource(project, proxyInstance string, log *zap.Logger) (*DockerRecoverySource, error) {
+	return NewDockerRecoverySourceWithConfig(project, proxyInstance, log, 2*time.Second, 10)
 }
 
 // NewDockerRecoverySourceWithConfig creates a recovery source with custom health config.
-func NewDockerRecoverySourceWithConfig(proxyInstance string, log *zap.Logger, tcpTimeout time.Duration, maxWorkers int) (*DockerRecoverySource, error) {
+func NewDockerRecoverySourceWithConfig(project, proxyInstance string, log *zap.Logger, tcpTimeout time.Duration, maxWorkers int) (*DockerRecoverySource, error) {
 	cl, err := client.NewClientWithOpts(
 		client.FromEnv,
 		client.WithAPIVersionNegotiation(),
@@ -61,6 +66,7 @@ func NewDockerRecoverySourceWithConfig(proxyInstance string, log *zap.Logger, tc
 	return &DockerRecoverySource{
 		client:           cl,
 		proxyInstance:    proxyInstance,
+		project:          project,
 		log:              log,
 		healthValidator:  NewHealthValidator(cl, log, tcpTimeout, maxWorkers),
 		tcpDialTimeout:   tcpTimeout,
@@ -221,6 +227,34 @@ func (d *DockerRecoverySource) DiscoverAndValidateBackends(ctx context.Context) 
 	return result, nil
 }
 
+// checkRecoveryOwnership evaluates DockerRecoverySource's full ownership
+// decision against already-extracted label values — pure, no Docker I/O, so
+// it is directly unit-testable even though extractBackend itself (which
+// needs a live *client.Client) is not (PR-A review Finding 2). Mirrors
+// checkProjectOwnership's role for the project dimension specifically, and
+// calls it for that check — so both components evaluate project ownership
+// via the exact same code, never two independently-written checks.
+func checkRecoveryOwnership(labels map[string]string, project, proxyInstance string) error {
+	service := labels["orbit.io/service"]
+	proxy := labels["orbit.io/proxy"]
+	generation := labels["orbit.io/generation"]
+
+	if service == "" || proxy == "" || generation == "" {
+		return fmt.Errorf("incomplete ownership labels")
+	}
+
+	if err := checkProjectOwnership(labels["com.docker.compose.project"], project); err != nil {
+		return err
+	}
+
+	// Verify this backend belongs to this proxy instance.
+	if pi := labels["orbit.io/proxy-instance"]; pi != "" && pi != proxyInstance {
+		return fmt.Errorf("ownership mismatch: container owned by instance %q, this is %q", pi, proxyInstance)
+	}
+
+	return nil
+}
+
 // extractBackend extracts Backend from a container.
 // Returns nil if validation fails (stale/invalid container).
 func (d *DockerRecoverySource) extractBackend(ctx context.Context, c types.Container) (*Backend, error) {
@@ -232,22 +266,8 @@ func (d *DockerRecoverySource) extractBackend(ctx context.Context, c types.Conta
 
 	labels := inspect.Config.Labels
 
-	// Validate ownership labels.
-	service := labels["orbit.io/service"]
-	proxy := labels["orbit.io/proxy"]
-	generation := labels["orbit.io/generation"]
-	proxyInstance := labels["orbit.io/proxy-instance"]
-
-	if service == "" || proxy == "" || generation == "" {
-		return nil, fmt.Errorf("incomplete ownership labels")
-	}
-
-	// Verify this backend belongs to this proxy instance.
-	if proxyInstance != "" && proxyInstance != d.proxyInstance {
-		return nil, fmt.Errorf(
-			"ownership mismatch: container owned by instance %q, this is %q",
-			proxyInstance, d.proxyInstance,
-		)
+	if err := checkRecoveryOwnership(labels, d.project, d.proxyInstance); err != nil {
+		return nil, err
 	}
 
 	// Extract backend ID from env.
@@ -288,7 +308,7 @@ func (d *DockerRecoverySource) extractBackend(ctx context.Context, c types.Conta
 	return &Backend{
 		ID:         backendID,
 		Addr:       addr,
-		Generation: generation,
+		Generation: labels["orbit.io/generation"],
 		Created:    time.Unix(c.Created, 0),
 	}, nil
 }

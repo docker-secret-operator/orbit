@@ -166,7 +166,7 @@ func TestEventSource_Reconnect(t *testing.T) {
 	reg := NewRegistry()
 	pr := NewProjectRegistry()
 	pr.Register("web", reg)
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	core, observed := observer.New(zapcore.DebugLevel)
 	log := zap.New(core)
@@ -252,7 +252,7 @@ func TestEventSource_ReconnectTriggersReconciliation(t *testing.T) {
 	reg := NewRegistry()
 	pr := NewProjectRegistry()
 	pr.Register("web", reg)
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	m := &spyEventSourceMetrics{}
 	es := NewEventSource(rc, docker, time.Hour, m, nil) // long periodic interval: isolate reconnect behavior
@@ -309,7 +309,7 @@ func TestEventSource_DuplicateEvents(t *testing.T) {
 	reg := NewRegistry()
 	pr := NewProjectRegistry()
 	pr.Register("web", reg)
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	m := &spyEventSourceMetrics{}
 	es := NewEventSource(rc, docker, time.Hour, m, nil)
@@ -354,7 +354,7 @@ func TestEventSource_IgnoredEvents(t *testing.T) {
 	reg := NewRegistry()
 	pr := NewProjectRegistry()
 	pr.Register("web", reg)
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	m := &spyEventSourceMetrics{}
 	es := NewEventSource(rc, docker, time.Hour, m, nil) // long interval: isolate event-driven behavior
@@ -394,7 +394,7 @@ func TestEventSource_Cancellation(t *testing.T) {
 	docker := &fakeEventDocker{} // Events() script exhausted immediately -> silent live connection
 	pr := NewProjectRegistry()
 	pr.Register("web", NewRegistry())
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	es := NewEventSource(rc, docker, time.Hour, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -424,7 +424,7 @@ func TestEventSource_Cancellation_DuringBackoff(t *testing.T) {
 
 	pr := NewProjectRegistry()
 	pr.Register("web", NewRegistry())
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	es := NewEventSource(rc, docker, time.Hour, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -458,7 +458,7 @@ func TestEventSource_PermanentReconnectFailureAfterLiveConnection_NoPanic(t *tes
 
 	pr := NewProjectRegistry()
 	pr.Register("web", NewRegistry())
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	es := NewEventSource(rc, docker, time.Hour, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -500,7 +500,7 @@ func TestEventSource_EventStorm(t *testing.T) {
 	reg := NewRegistry()
 	pr := NewProjectRegistry()
 	pr.Register("web", reg)
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	m := &spyEventSourceMetrics{}
 	es := NewEventSource(rc, docker, time.Hour, m, nil)
@@ -552,7 +552,7 @@ func TestEventSource_SerializedReconciliation(t *testing.T) {
 
 	pr := NewProjectRegistry()
 	pr.Register("web", NewRegistry())
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	es := NewEventSource(rc, docker, 20*time.Millisecond, nil, nil) // short interval to force the periodic tick to fire the first ContainerList
 	ctx, cancel := context.WithCancel(context.Background())
@@ -612,7 +612,7 @@ func TestEventSource_DaemonUnavailable(t *testing.T) {
 
 	pr := NewProjectRegistry()
 	pr.Register("web", NewRegistry())
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	m := &spyEventSourceMetrics{}
 	es := NewEventSource(rc, docker, time.Hour, m, nil)
@@ -636,7 +636,7 @@ func TestEventSource_Run_Race(t *testing.T) {
 	conn := newFakeEventConnection()
 	docker := &fakeEventDocker{connections: []*fakeEventConnection{conn}}
 	pr := NewProjectRegistry()
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	es := NewEventSource(rc, docker, 5*time.Millisecond, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -667,7 +667,7 @@ func TestEventSource_LoggingTriggerField(t *testing.T) {
 	docker := &fakeEventDocker{connections: []*fakeEventConnection{conn}}
 	pr := NewProjectRegistry()
 	pr.Register("web", NewRegistry())
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	core, observed := observer.New(zapcore.InfoLevel)
 	log := zap.New(core)
@@ -716,7 +716,7 @@ func TestEventSource_IgnoredEvent_DebugLogged(t *testing.T) {
 	docker := &fakeEventDocker{connections: []*fakeEventConnection{conn}}
 	pr := NewProjectRegistry()
 	pr.Register("web", NewRegistry())
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	core, observed := observer.New(zapcore.DebugLevel) // capture Debug and above
 	log := zap.New(core)
@@ -793,7 +793,7 @@ func TestEventSource_IgnoredEvent_NotVisibleAtDefaultLevel(t *testing.T) {
 	docker := &fakeEventDocker{connections: []*fakeEventConnection{conn}}
 	pr := NewProjectRegistry()
 	pr.Register("web", NewRegistry())
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	core, observed := observer.New(zapcore.InfoLevel) // default production level
 	log := zap.New(core)
@@ -842,7 +842,7 @@ func TestEventSource_ReconnectCancelsPreviousConnection(t *testing.T) {
 
 	pr := NewProjectRegistry()
 	pr.Register("web", NewRegistry())
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	es := NewEventSource(rc, docker, time.Hour, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -905,7 +905,7 @@ func TestEventSource_StoppedLogEmitted(t *testing.T) {
 	docker := &fakeEventDocker{}
 	pr := NewProjectRegistry()
 	pr.Register("web", NewRegistry())
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 
 	core, observed := observer.New(zapcore.InfoLevel)
 	log := zap.New(core)
@@ -955,7 +955,7 @@ func TestEventSource_RepeatedReconnectCycles(t *testing.T) {
 
 	pr := NewProjectRegistry()
 	pr.Register("web", NewRegistry())
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	m := &spyEventSourceMetrics{}
 	es := NewEventSource(rc, docker, time.Hour, m, nil)
 
@@ -1026,7 +1026,7 @@ func TestEventSource_TransientDockerFailureRecovers(t *testing.T) {
 	pr := NewProjectRegistry()
 	pr.Register("web", reg)
 	m := &spyReconcilerMetrics{}
-	rc := NewReconciler(pr, docker, m, nil)
+	rc := NewReconciler(pr, docker, "test-project", m, nil)
 
 	esMetrics := &spyEventSourceMetrics{}
 	es := NewEventSource(rc, docker, time.Hour, esMetrics, nil)
@@ -1101,7 +1101,7 @@ func TestEventSource_ShutdownDuringReconciliation(t *testing.T) {
 	reg := NewRegistry()
 	pr := NewProjectRegistry()
 	pr.Register("web", reg)
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	es := NewEventSource(rc, docker, 20*time.Millisecond, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1146,7 +1146,7 @@ func TestEventSource_ResilienceRace(t *testing.T) {
 	}
 	docker := &fakeEventDocker{connections: ifaceConns}
 	pr := NewProjectRegistry()
-	rc := NewReconciler(pr, docker, nil, nil)
+	rc := NewReconciler(pr, docker, "test-project", nil, nil)
 	es := NewEventSource(rc, docker, 3*time.Millisecond, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())

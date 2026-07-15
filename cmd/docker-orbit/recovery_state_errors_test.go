@@ -56,7 +56,7 @@ func TestExecuteRecovery_CorruptedActiveGenState_LogsError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	executeRecovery(ctx, cfg, sm, reg, service, mc, debugHandler, log)
+	executeRecovery(ctx, cfg, sm, reg, "test-project", service, mc, debugHandler, log)
 
 	found := false
 	for _, entry := range observed.All() {
