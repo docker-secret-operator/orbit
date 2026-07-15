@@ -94,12 +94,20 @@ locate_artifacts() {
     command -v curl >/dev/null 2>&1 || die "curl is required to download release artifacts"
     local version="${ORBIT_VERSION:-latest}"
     if [ "$version" = "latest" ]; then
-      version="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | awk -F'"' '/"tag_name"/ {print $4; exit}')"
+      # Capture the full response before parsing it: piping curl directly into
+      # an awk that `exit`s on first match closes the pipe mid-stream, which
+      # can SIGPIPE curl (exit 23) and, under `pipefail`, kill the installer
+      # before it ever downloads anything.
+      local api_response
+      api_response="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")" \
+        || die "could not reach GitHub API to resolve latest release"
+      version="$(printf '%s' "$api_response" | awk -F'"' '/"tag_name"/ {print $4; exit}')"
       [ -n "$version" ] || die "could not resolve latest release tag (is the repo public and released?)"
     fi
     local base="${ORBIT_BASE_URL:-https://github.com/${REPO}/releases/download/${version}}"
-    local name="${BINARY}_${version}_${OS}_${ARCH}.tar.gz"
+    # Artifact filenames use GoReleaser's .Version (tag with any leading "v"
+    # stripped), while the release download URL path segment uses the tag as-is.
+    local name="${BINARY}_${version#v}_${OS}_${ARCH}.tar.gz"
     ARCHIVE="${WORKDIR}/${name}"
     CHECKSUMS="${WORKDIR}/checksums.txt"
     info "downloading ${name} (${version})"
