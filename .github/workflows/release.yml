@@ -25,6 +25,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.26"
+          check-latest: true
           cache: true
 
       # Gate the release on the same quality bar as CI before building artifacts.

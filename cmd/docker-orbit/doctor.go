@@ -20,6 +20,7 @@ import (
 	dockerclient "github.com/docker/docker/client"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
+	"golang.org/x/term"
 )
 
 // CheckStatus classifies a single doctor check's outcome.
@@ -29,6 +30,11 @@ const (
 	StatusPass CheckStatus = "PASS"
 	StatusWarn CheckStatus = "WARNING"
 	StatusFail CheckStatus = "ERROR"
+	// StatusSkip marks a check that didn't run because an earlier check it
+	// depends on already failed — distinct from StatusWarn so one root cause
+	// (e.g. a missing compose file) doesn't inflate the warning count for
+	// every check downstream of it.
+	StatusSkip CheckStatus = "SKIPPED"
 )
 
 // Check is one doctor diagnostic result. Detail is a plain-language
@@ -49,6 +55,7 @@ type DoctorReport struct {
 		Pass    int `json:"pass"`
 		Warning int `json:"warning"`
 		Error   int `json:"error"`
+		Skipped int `json:"skipped"`
 	} `json:"summary"`
 }
 
@@ -122,6 +129,8 @@ func runDoctorChecks(ctx context.Context, controlAddr, composeFile, service stri
 			report.Summary.Warning++
 		case StatusFail:
 			report.Summary.Error++
+		case StatusSkip:
+			report.Summary.Skipped++
 		}
 	}
 	return report
@@ -177,9 +186,9 @@ func checkComposeAvailable(ctx context.Context) Check {
 func checkPortsAvailable(composeFilePath string) Check {
 	cf, err := compose.ParseFile(composeFilePath)
 	if err != nil {
-		return Check{Name: "Required ports available", Status: StatusWarn,
-			Detail:      "could not read " + composeFilePath + " to determine which ports to check — see 'Compose file' check",
-			Remediation: "Resolve the compose file issue first, or pass --file"}
+		return Check{Name: "Required ports available", Status: StatusSkip,
+			Detail:      "skipped — depends on a valid compose file (see 'Compose file' check above)",
+			Remediation: "Resolve the compose file issue above, then re-run doctor"}
 	}
 
 	var busy []string
@@ -331,15 +340,35 @@ func checkPluginInstalled() Check {
 // renderDoctorHuman writes to w best-effort — see renderStatusHuman's doc
 // comment in status.go for why write errors are explicitly discarded here.
 func renderDoctorHuman(w io.Writer, r DoctorReport) {
+	color := colorEnabled(w)
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
 	for _, c := range r.Checks {
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\n", statusGlyph(c.Status), c.Name, c.Detail)
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\n", colorGlyph(c.Status, color), c.Name, c.Detail)
 		if c.Remediation != "" {
-			_, _ = fmt.Fprintf(tw, "\t\t  → %s\n", c.Remediation)
+			remediation := "→ " + c.Remediation
+			if color {
+				remediation = ansiDim + remediation + ansiReset
+			}
+			_, _ = fmt.Fprintf(tw, "\t\t  %s\n", remediation)
 		}
 	}
 	_ = tw.Flush()
-	_, _ = fmt.Fprintf(w, "\n%d passed, %d warning, %d error\n", r.Summary.Pass, r.Summary.Warning, r.Summary.Error)
+
+	summary := fmt.Sprintf("%d passed, %d warning, %d error", r.Summary.Pass, r.Summary.Warning, r.Summary.Error)
+	if r.Summary.Skipped > 0 {
+		summary += fmt.Sprintf(", %d skipped", r.Summary.Skipped)
+	}
+	if color {
+		switch {
+		case r.Summary.Error > 0:
+			summary = ansiRed + summary + ansiReset
+		case r.Summary.Warning > 0:
+			summary = ansiYellow + summary + ansiReset
+		default:
+			summary = ansiGreen + summary + ansiReset
+		}
+	}
+	_, _ = fmt.Fprintf(w, "\n%s\n", summary)
 }
 
 func statusGlyph(s CheckStatus) string {
@@ -350,7 +379,57 @@ func statusGlyph(s CheckStatus) string {
 		return "⚠ WARN"
 	case StatusFail:
 		return "✗ FAIL"
+	case StatusSkip:
+		return "○ SKIP"
 	default:
 		return string(s)
 	}
+}
+
+const (
+	ansiReset  = "\033[0m"
+	ansiGreen  = "\033[0;32m"
+	ansiYellow = "\033[1;33m"
+	ansiRed    = "\033[0;31m"
+	ansiDim    = "\033[2m"
+)
+
+// colorGlyph wraps statusGlyph's plain text in color only when color is
+// true — kept separate from statusGlyph itself since that function is
+// shared with deploy/rollback preflight rendering, which this change
+// intentionally leaves untouched.
+func colorGlyph(s CheckStatus, color bool) string {
+	glyph := statusGlyph(s)
+	if !color {
+		return glyph
+	}
+	switch s {
+	case StatusPass:
+		return ansiGreen + glyph + ansiReset
+	case StatusWarn:
+		return ansiYellow + glyph + ansiReset
+	case StatusFail:
+		return ansiRed + glyph + ansiReset
+	case StatusSkip:
+		return ansiDim + glyph + ansiReset
+	default:
+		return glyph
+	}
+}
+
+// colorEnabled reports whether w is a real terminal, so output can be
+// colorized without ever leaking ANSI escapes into piped/redirected output,
+// log files, or test buffers (a bytes.Buffer is never an *os.File, so this
+// always returns false for the golden-file tests, independent of whatever
+// terminal happens to be running `go test`). Honors NO_COLOR per
+// https://no-color.org.
+func colorEnabled(w io.Writer) bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	return term.IsTerminal(int(f.Fd()))
 }

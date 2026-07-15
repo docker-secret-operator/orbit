@@ -16,6 +16,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26'
+          # Without this, setup-go matches whatever 1.26.x is already cached
+          # on the runner image rather than the newest patch — CI silently
+          # ran go1.26.4 while go1.26.5 (fixing GO-2026-5856) was available.
+          check-latest: true
           cache: true
 
       - name: Download modules

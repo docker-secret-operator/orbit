@@ -221,8 +221,8 @@ func TestCheckPortsAvailableDetectsBusyPort(t *testing.T) {
 
 func TestCheckPortsAvailableMissingFile(t *testing.T) {
 	c := checkPortsAvailable(filepath.Join(t.TempDir(), "does-not-exist.yml"))
-	if c.Status != StatusWarn {
-		t.Errorf("Status = %v, want WARNING when the compose file can't be read", c.Status)
+	if c.Status != StatusSkip {
+		t.Errorf("Status = %v, want SKIPPED when the compose file can't be read (it's the same root cause as the 'Compose file' check, not an independent warning)", c.Status)
 	}
 }
 
@@ -254,7 +254,7 @@ func TestRenderDoctorHumanGolden(t *testing.T) {
 func TestRunDoctorChecksSummaryCounts(t *testing.T) {
 	report := runDoctorChecks(context.Background(), "http://127.0.0.1:1", filepath.Join(t.TempDir(), "missing.yml"), "test")
 
-	total := report.Summary.Pass + report.Summary.Warning + report.Summary.Error
+	total := report.Summary.Pass + report.Summary.Warning + report.Summary.Error + report.Summary.Skipped
 	if total != len(report.Checks) {
 		t.Errorf("summary counts (%d) don't add up to len(Checks) (%d)", total, len(report.Checks))
 	}
