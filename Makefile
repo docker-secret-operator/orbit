@@ -7,9 +7,11 @@ TAG        := latest
 # Override with: make PLUGIN_DIR=~/.docker/cli-plugins install-plugin
 PLUGIN_DIR := /usr/local/lib/docker/cli-plugins
 
-# /usr/bin/go is a trimmed distro stub with no GOROOT; use the real toolchain.
+# /usr/bin/go is a trimmed distro stub with no GOROOT; prefer a working `go`
+# already on PATH (e.g. actions/setup-go's install) and fall back to the
+# known-good local toolchain path otherwise.
 # Override with: make GO=/path/to/go build
-GO         ?= /usr/local/go/bin/go
+GO         ?= $(shell command -v go 2>/dev/null || echo /usr/local/go/bin/go)
 
 # VERSION: derived from the nearest git tag; falls back to "dev" outside a
 # git checkout or before the first tag exists. See docs/governance/RELEASES.md.
