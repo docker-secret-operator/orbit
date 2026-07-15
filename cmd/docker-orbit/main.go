@@ -73,6 +73,12 @@ so that container replacements happen without dropping a single connection.
 
 No external proxy (Traefik, nginx) required.
 
+A --shared-proxy flag on 'generate' below fronts every service with one
+proxy container instead of one per service — see 'docker orbit generate
+--help' before using it: for now it only fully works for a single-service
+project, since rollout/rollback aren't wired to its control API yet for
+more than one service.
+
 Example:
   docker orbit generate                         # enhance docker-compose.yml
   docker compose -f docker-rollout-compose.yml up -d
@@ -131,11 +137,17 @@ service instead of one proxy per service (ADR-0006), plus a
 docker-rollout-services.json companion file the shared proxy reads at
 startup. Opt-in and off by default — omitting the flag produces exactly
 the same output as before, so existing deployments are never silently
-switched to the new topology by regenerating. Only the default service
-(the first, alphabetically, among those proxied) is reachable via
-unscoped 'docker orbit rollout/recover/status --control-addr' today —
-targeting any other service through the shared proxy's control API
-requires the service-scoped routes, not yet implemented.
+switched to the new topology by regenerating.
+
+WARNING: for a project with more than one proxied service, the shared
+proxy's control API rejects every mutating request (rollout, rollback,
+recover's per-service paths, deploy) with 400 ambiguous_service — the
+service-scoped control-API routes ADR-0006 requires for this are not
+implemented yet, and the proxy never guesses which service an unscoped
+request means. 'docker orbit status' (read-only) still works. Do not use
+--shared-proxy yet for a project with more than one proxied service if
+you need to actually roll out/back/deploy those services — stay on the
+default (one proxy per service) until service-scoped routes ship.
 
 Example:
   docker orbit generate

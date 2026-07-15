@@ -212,12 +212,14 @@ Reads your `docker-compose.yml` and writes `docker-rollout-compose.yml`. Your or
 ```bash
 docker-orbit generate
 docker-orbit generate --file docker-compose.prod.yml --output docker-rollout-compose.prod.yml
+docker-orbit generate --shared-proxy    # one proxy container for the whole project, not one per service
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--file`, `-f` | `docker-compose.yml` | Input compose file |
 | `--output`, `-o` | `docker-rollout-compose.yml` | Output file path |
+| `--shared-proxy` | `false` | Generate a single shared proxy fronting every eligible service instead of one proxy per service ([ADR-0006](docs/adr/ADR-0006-shared-proxy-and-event-driven-discovery.md)). Off by default so regenerating never silently changes an existing deployment's topology. **Not yet usable for a multi-service project in production**: the shared proxy's control API rejects every `rollout`/`rollback`/deploy request with a 400 once it fronts more than one service — the service-scoped routes ADR-0006 requires haven't shipped. Fine today only for a single-service project. |
 
 ### `docker-orbit deploy <service>`
 

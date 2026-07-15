@@ -398,6 +398,13 @@ func buildLegacyProxyService(name string, pairs []portPair) Service {
 				"orbit.io/managed": "true",
 			},
 			"restart": "unless-stopped",
+			// technicaltalk/orbit:latest is rebuilt on every push to main
+			// (.github/workflows/ci.yml) — pull_policy: always makes `docker
+			// compose up` re-check the registry and pull a newer digest under
+			// the same tag before (re)starting the proxy, instead of reusing
+			// whatever was pulled locally the first time. Compose v2 only
+			// (required elsewhere in this project already; see installation.md).
+			"pull_policy": "always",
 			// Required for startup/on-demand recovery (internal/proxy.DockerRecoverySource):
 			// the proxy lists and inspects Orbit-managed containers by label to
 			// discover and validate backends. Read-only — it never creates,
@@ -512,6 +519,8 @@ func buildSharedProxyService(entries []sharedEntry) (Service, []PortBinding) {
 				"orbit.io/services": strings.Join(names, ","),
 			},
 			"restart": "unless-stopped",
+			// See buildLegacyProxyService's identical field for why.
+			"pull_policy": "always",
 			"volumes": toRawSlice([]string{
 				"/var/run/docker.sock:/var/run/docker.sock:ro",
 				sharedStateVolumeName + ":/var/lib/orbit",
