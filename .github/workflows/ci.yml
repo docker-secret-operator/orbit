@@ -56,10 +56,51 @@ jobs:
         with:
           version: latest
 
+      # Fails the build on any govulncheck finding that isn't on the reviewed
+      # accepted-risk list below. See docs/governance/SECURITY.md "Dependency
+      # Scanning" for the rationale on each accepted ID: all six are dockerd
+      # (daemon)-side CVEs (archive extraction, `docker cp` races, AuthZ
+      # bypass, plugin privilege validation, firewalld/bridge isolation) —
+      # Orbit only imports github.com/docker/docker/client to call an
+      # independently-running dockerd over its API and never executes daemon
+      # code. Only GO-2025-3829 has a fixed version at all; the other five
+      # are unfixed upstream even at latest, so upgrading would not clear
+      # them regardless. Re-review this list if Orbit ever embeds or manages
+      # the daemon directly, or if govulncheck reports a NEW id not below —
+      # this step intentionally still fails on anything unreviewed.
       - name: Security (govulncheck)
-        uses: golang/govulncheck-action@v1
-        with:
-          go-version-input: '1.26'
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+
+          accepted="GO-2026-5746 GO-2026-5668 GO-2026-5617 GO-2026-4887 GO-2026-4883 GO-2025-3829"
+
+          set +e
+          output="$(govulncheck ./... 2>&1)"
+          exit_code=$?
+          set -e
+          echo "$output"
+
+          if [ "$exit_code" -ne 0 ] && [ "$exit_code" -ne 3 ]; then
+            echo "govulncheck failed to run (exit $exit_code)"
+            exit "$exit_code"
+          fi
+
+          found="$(echo "$output" | grep -oE '^Vulnerability #[0-9]+: GO-[0-9]+-[0-9]+' | grep -oE 'GO-[0-9]+-[0-9]+$')"
+          unaccepted=""
+          for id in $found; do
+            case " $accepted " in
+              *" $id "*) ;;
+              *) unaccepted="$unaccepted $id" ;;
+            esac
+          done
+
+          if [ -n "$unaccepted" ]; then
+            echo "New/unaccepted vulnerabilities found:$unaccepted"
+            echo "Review against docs/governance/SECURITY.md and either fix or add to the accepted list with documented rationale."
+            exit 1
+          fi
+
+          echo "All findings are on the reviewed accepted-risk list (docs/governance/SECURITY.md); passing."
 
   docker:
     name: Docker Build (multi-arch smoke test)
